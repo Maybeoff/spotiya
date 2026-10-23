@@ -38,6 +38,7 @@ mod device;
 mod ducking;
 mod logging;
 mod playback;
+mod profile_selection;
 mod profiles;
 mod recovery;
 mod spectrum;
@@ -228,7 +229,7 @@ struct Options {
     buttons: bool,
     voice: bool,
     supervise: bool,
-    profile: String,
+    profile: Option<String>,
 }
 fn options() -> Result<Option<Options>, String> {
     let mut result = Options {
@@ -237,27 +238,31 @@ fn options() -> Result<Option<Options>, String> {
         buttons: true,
         voice: true,
         supervise: false,
-        profile: "auto".into(),
+        profile: None,
     };
     let mut args = std::env::args().skip(1);
     let mut profile_info = false;
+    let mut profile_list = false;
+    let mut profile_select = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--state-dir" => {
                 result.state_dir = args.next().ok_or("missing state directory")?.into()
             }
             "--name" => result.name = args.next().ok_or("missing device name")?,
-            "--profile" => result.profile = args.next().ok_or("missing profile id or JSON path")?,
+            "--profile" => {
+                result.profile = Some(args.next().ok_or("missing profile id or JSON path")?)
+            }
             "--profile-info" => profile_info = true,
-            "--profiles" => {
-                profiles::list();
-                return Ok(None);
+            "--profiles" => profile_list = true,
+            "--profile-select" => {
+                profile_select = Some(args.next().ok_or("missing profile id or JSON path")?)
             }
             "--supervise" => result.supervise = true,
             "--no-buttons" => result.buttons = false,
             "--no-voice" => result.voice = false,
             "--tui" => {
-                tui::run().map_err(|e| e.to_string())?;
+                tui::run(&result.state_dir).map_err(|e| e.to_string())?;
                 return Ok(None);
             }
             "--login" => {
@@ -312,12 +317,23 @@ fn options() -> Result<Option<Options>, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info\nspotiya --tui | --login | --status | --version\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --release | --retry"
+                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --login | --status | --version\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --release | --retry"
                 );
                 return Ok(None);
             }
             _ => return Err(format!("unknown option: {arg}")),
         }
+    }
+    if let Some(choice) = profile_select {
+        println!(
+            "{}",
+            profile_selection::select(&result.state_dir, &choice).map_err(|e| e.to_string())?
+        );
+        return Ok(None);
+    }
+    if profile_list {
+        profiles::list(&result.state_dir).map_err(|e| e.to_string())?;
+        return Ok(None);
     }
     if profile_info {
         let resolved = resolved_profile(&result).map_err(|e| e.to_string())?;
@@ -330,7 +346,7 @@ fn options() -> Result<Option<Options>, String> {
     Ok(Some(result))
 }
 fn resolved_profile(options: &Options) -> io::Result<profiles::Resolved> {
-    let mut resolved = profiles::load(&options.profile, &options.state_dir)?;
+    let mut resolved = profiles::load(options.profile.as_deref(), &options.state_dir)?;
     if !options.buttons {
         resolved.capabilities.buttons = false;
         resolved.capabilities.ring = false;
@@ -586,6 +602,17 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         voice: voice_enabled,
         voice_supported: caps.voice,
         profile: profile.id.clone(),
+        profile_selection: options
+            .profile
+            .clone()
+            .or_else(|| {
+                profile_selection::read(&options.state_dir)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.selection)
+            })
+            .unwrap_or_else(|| "auto".into()),
+        receiver_pid: std::process::id(),
         spectrum_supported,
         ..Default::default()
     };
@@ -596,6 +623,14 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "receiver: ready, profile={}, buttons={}, ring={}, display={}, voice={}",
         profile.id, caps.buttons, caps.ring, caps.display, caps.voice
+    );
+    publish_status(
+        &shared,
+        &playback,
+        &failures,
+        &mut info,
+        &mut last_status,
+        &mut status_buffer,
     );
     loop {
         tokio::select! {

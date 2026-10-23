@@ -33,6 +33,8 @@ pub struct Status {
     pub voice: bool,
     pub voice_supported: bool,
     pub profile: String,
+    pub profile_selection: String,
+    pub receiver_pid: u32,
     pub native_guard: bool,
     pub ducking: bool,
     pub spectrum: bool,

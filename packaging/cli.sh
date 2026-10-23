@@ -12,7 +12,14 @@ case "${1:-tui}" in
         ;;
     profile)
         shift
-        set -- --profile-info "$@"
+        if [ "${1:-}" = select ]; then
+            shift
+            [ "$#" -eq 1 ] || { echo 'Usage: spotiya profile select ID_OR_JSON' >&2; exit 1; }
+            set -- --profile-select "$1"
+        else
+            [ "$#" -eq 0 ] || { echo 'Usage: spotiya profile [select ID_OR_JSON]' >&2; exit 1; }
+            set -- --profile-info
+        fi
         ;;
     tui|login|status|pause|resume|toggle|next|previous|volume|voice|spectrum|retry|release|version|help|profiles)
         SPOTIYA_COMMAND=${1:-tui}

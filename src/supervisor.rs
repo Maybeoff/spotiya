@@ -47,6 +47,7 @@ fn offline_status(config: &Config, message: &str) {
     status.loading = false;
     status.connected = false;
     status.native_guard = false;
+    status.receiver_pid = 0;
     status.ducking = false;
     status.retry_required = false;
     status.retry_after_secs = 0;
@@ -134,9 +135,11 @@ pub async fn run(options: &Options) -> io::Result<()> {
         options.state_dir.clone().into_os_string(),
         OsString::from("--name"),
         OsString::from(&options.name),
-        OsString::from("--profile"),
-        OsString::from(&options.profile),
     ];
+    if let Some(profile) = &options.profile {
+        args.push("--profile".into());
+        args.push(profile.into());
+    }
     if !options.buttons {
         args.push("--no-buttons".into());
     }

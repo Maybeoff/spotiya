@@ -55,6 +55,13 @@ def main():
         if len(args.value) != 1:
             parser.error(args.command + " needs one value")
         value = args.value
+    elif args.command == "profile":
+        if not args.value:
+            value = []
+        elif len(args.value) == 2 and args.value[0] == "select":
+            value = [args.value[1]]
+        else:
+            parser.error("profile accepts: select ID_OR_JSON")
     else:
         if args.value:
             parser.error("unexpected arguments")
@@ -68,7 +75,7 @@ def main():
         start = subprocess.run(adb + ["shell", shlex.join([BASE + "/start.sh"])], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if start.returncode or not any(s in start.stdout for s in ("already running", "Connect started")):
             sys.exit(start.stdout.strip() or "Unable to start receiver")
-    remote_command = "profile-info" if args.command == "profile" else args.command
+    remote_command = ("profile-select" if value else "profile-info") if args.command == "profile" else args.command
     remote = shlex.join([BASE + "/spotiya", "--" + remote_command] + value)
     if args.command == "tui":
         columns, rows = shutil.get_terminal_size(fallback=(80, 24))

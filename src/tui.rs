@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{self, IsTerminal, Read, Write},
     os::fd::AsRawFd,
+    path::Path,
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -151,7 +152,7 @@ fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> 
         String::new(),
         "Space pause/play   n next   p previous   +/- volume".into(),
         "/ search   l login   v voice   e spectrum on/off".into(),
-        "r retry   x release to Alice   q quit".into(),
+        "r retry   d device profile   x release to Alice   q quit".into(),
         String::new(),
     ];
     if !status.error.is_empty() {
@@ -175,8 +176,11 @@ fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> 
 }
 fn draw(status: &Status, notice: &str, prompt: Option<&[u8]>) -> io::Result<()> {
     let (width, height) = size();
+    draw_lines(lines(status, notice, prompt, width), width, height)
+}
+fn draw_lines(content: Vec<String>, width: usize, height: usize) -> io::Result<()> {
     let mut frame = String::from("\x1b[H");
-    for (i, line) in lines(status, notice, prompt, width)
+    for (i, line) in content
         .into_iter()
         .take(height.saturating_sub(1))
         .enumerate()
@@ -201,16 +205,110 @@ fn draw(status: &Status, notice: &str, prompt: Option<&[u8]>) -> io::Result<()> 
     print!("{frame}");
     io::stdout().flush()
 }
-pub fn run() -> io::Result<()> {
+struct ProfileMenu {
+    entries: Vec<crate::profile_selection::Choice>,
+    selected: usize,
+    escape: u8,
+    escape_at: Instant,
+    current: String,
+    notice: String,
+}
+enum ProfileAction {
+    Apply,
+    Cancel,
+}
+impl ProfileMenu {
+    fn new(state: &Path, current: &str) -> io::Result<Self> {
+        let entries = crate::profile_selection::choices(state)?;
+        let selected = entries.iter().position(|c| c.key() == current).unwrap_or(0);
+        Ok(Self {
+            entries,
+            selected,
+            escape: 0,
+            escape_at: Instant::now(),
+            current: current.into(),
+            notice: String::new(),
+        })
+    }
+    fn key(&mut self, key: u8) -> Option<ProfileAction> {
+        if key == 27 {
+            self.escape = 1;
+            self.escape_at = Instant::now();
+            return None;
+        }
+        if self.escape == 1 && key == b'[' {
+            self.escape = 2;
+            return None;
+        }
+        let key = if self.escape == 2 {
+            self.escape = 0;
+            match key {
+                b'A' => b'k',
+                b'B' => b'j',
+                _ => return None,
+            }
+        } else {
+            key
+        };
+        match key {
+            b'q' => Some(ProfileAction::Cancel),
+            b'\r' | b'\n' => Some(ProfileAction::Apply),
+            b'j' | b'n' => {
+                self.selected = (self.selected + 1) % self.entries.len();
+                None
+            }
+            b'k' | b'p' => {
+                self.selected = (self.selected + self.entries.len() - 1) % self.entries.len();
+                None
+            }
+            _ => None,
+        }
+    }
+    fn lines(&self, height: usize) -> Vec<String> {
+        let count = height.saturating_sub(9).max(1);
+        let start = self.selected.saturating_sub(count - 1);
+        let mut out = vec!["SPOTIYA — DEVICE PROFILE".into(), String::new()];
+        for (index, choice) in self.entries.iter().enumerate().skip(start).take(count) {
+            out.push(format!(
+                "{} {}{}",
+                if index == self.selected { ">" } else { " " },
+                safe(&choice.name),
+                if choice.key() == self.current {
+                    " [current]"
+                } else {
+                    ""
+                }
+            ));
+        }
+        out.push(String::new());
+        out.push(safe(&self.entries[self.selected].detail));
+        out.push("Up/down or j/k: choose   Enter: apply   Esc/q: back".into());
+        out.push("Applying restarts a running receiver and stops playback.".into());
+        out.push(safe(&self.notice));
+        out
+    }
+    fn draw(&self) -> io::Result<()> {
+        let (width, height) = size();
+        draw_lines(self.lines(height), width, height)
+    }
+}
+pub fn run(state_dir: &Path) -> io::Result<()> {
     use std::io::BufRead;
     let _terminal = Terminal::enter()?;
     let mut status = Status::default();
     let mut notice = "Ready. / searches Spotify; l pairs an account.".to_owned();
     let mut prompt: Option<Vec<u8>> = None;
+    let mut profiles: Option<ProfileMenu> = None;
     let (updates, rx) = mpsc::channel::<String>();
     let mut login_socket: Option<std::os::unix::net::UnixStream> = None;
     let mut last_draw = Instant::now() - Duration::from_secs(1);
     loop {
+        if profiles
+            .as_ref()
+            .is_some_and(|p| p.escape != 0 && p.escape_at.elapsed() > Duration::from_millis(180))
+        {
+            profiles = None;
+        }
         if let Ok(text) = fs::read_to_string(control::STATUS)
             && let Ok(fresh) = serde_json::from_str(&text)
         {
@@ -223,7 +321,11 @@ pub fn run() -> io::Result<()> {
             notice = message;
         }
         if last_draw.elapsed() >= Duration::from_millis(250) {
-            draw(&status, &notice, prompt.as_deref())?;
+            if let Some(menu) = &profiles {
+                menu.draw()?;
+            } else {
+                draw(&status, &notice, prompt.as_deref())?;
+            }
             last_draw = Instant::now();
         }
         let mut input = [0u8; 64];
@@ -234,6 +336,27 @@ pub fn run() -> io::Result<()> {
                     let _ = s.shutdown(std::net::Shutdown::Both);
                 }
                 return Ok(());
+            }
+            if let Some(menu) = profiles.as_mut() {
+                match menu.key(key) {
+                    Some(ProfileAction::Cancel) => profiles = None,
+                    Some(ProfileAction::Apply) => {
+                        let choice = menu.entries[menu.selected].key().to_owned();
+                        menu.notice = "Applying profile...".into();
+                        menu.draw()?;
+                        if let Some(socket) = login_socket.take() {
+                            let _ = socket.shutdown(std::net::Shutdown::Both);
+                        }
+                        notice = match crate::profile_selection::select(state_dir, &choice) {
+                            Ok(message) => message,
+                            Err(e) => e.to_string(),
+                        };
+                        profiles = None;
+                    }
+                    None => {}
+                }
+                last_draw = Instant::now() - Duration::from_secs(1);
+                continue;
             }
             if let Some(text) = prompt.as_mut() {
                 match key {
@@ -304,6 +427,13 @@ pub fn run() -> io::Result<()> {
                     }
                 }
                 b'x' => Some("RELEASE".to_owned()),
+                b'd' => {
+                    match ProfileMenu::new(state_dir, &status.profile_selection) {
+                        Ok(menu) => profiles = Some(menu),
+                        Err(e) => notice = e.to_string(),
+                    }
+                    None
+                }
                 b'/' => {
                     prompt = Some(Vec::new());
                     None
@@ -357,6 +487,28 @@ pub fn run() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profile_menu_navigation_scrolls_and_cancel_does_not_save() {
+        let root = std::env::temp_dir().join(format!("spotiya-menu-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut menu = ProfileMenu::new(&root, "auto").unwrap();
+        for key in b"\x1b[B\x1b[B" {
+            assert!(menu.key(*key).is_none());
+        }
+        assert_eq!(menu.entries[menu.selected].key(), "generic");
+        assert!(
+            menu.lines(10)
+                .iter()
+                .any(|line| line.contains("> Generic ALSA"))
+        );
+        assert!(matches!(menu.key(b'q'), Some(ProfileAction::Cancel)));
+        assert!(crate::profile_selection::read(&root).unwrap().is_none());
+        menu.key(b'j');
+        assert_eq!(menu.entries[menu.selected].key(), "auto");
+        assert!(matches!(menu.key(b'\r'), Some(ProfileAction::Apply)));
+        assert!(crate::profile_selection::read(&root).unwrap().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn loading_and_failed_tracks_are_not_shown_as_playing() {
         let mut status = Status {

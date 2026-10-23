@@ -134,7 +134,7 @@ fn valid_path(s: &str) -> bool {
         && Path::new(s).is_absolute()
         && !Path::new(s).components().any(|p| p == Component::ParentDir)
 }
-fn parse(text: &str) -> io::Result<Profile> {
+pub(crate) fn parse(text: &str) -> io::Result<Profile> {
     let p: Profile =
         serde_json::from_str(text).map_err(|e| invalid(format!("Invalid device profile: {e}")))?;
     if p.version != 1
@@ -261,8 +261,42 @@ fn capabilities(p: &Profile, root: &Path) -> Capabilities {
     }
     caps
 }
-pub fn load(selection: &str, state_dir: &Path) -> io::Result<Resolved> {
-    load_at(selection, state_dir, Path::new("/"))
+pub fn load(selection: Option<&str>, state_dir: &Path) -> io::Result<Resolved> {
+    let saved = if let Some(choice) = selection {
+        Some(crate::profile_selection::resolve(state_dir, choice)?)
+    } else {
+        crate::profile_selection::read(state_dir)?
+    };
+    if let Some(saved) = saved {
+        resolve_saved(saved, state_dir)
+    } else {
+        load_at("auto", state_dir, Path::new("/"))
+    }
+}
+pub(crate) fn resolve_saved(
+    saved: crate::profile_selection::Saved,
+    state_dir: &Path,
+) -> io::Result<Resolved> {
+    if let Some(profile) = saved.profile {
+        let caps = capabilities(&profile, Path::new("/"));
+        Ok(Resolved {
+            profile,
+            capabilities: caps,
+            source: saved.selection,
+        })
+    } else {
+        load_at(&saved.selection, state_dir, Path::new("/"))
+    }
+}
+pub(crate) fn read_file(path: &Path) -> io::Result<Profile> {
+    let mut text = String::new();
+    fs::File::open(path)?
+        .take(32769)
+        .read_to_string(&mut text)?;
+    if text.len() > 32768 {
+        return Err(invalid("Device profile exceeds 32 KiB"));
+    }
+    parse(&text)
 }
 fn load_at(selection: &str, state_dir: &Path, root: &Path) -> io::Result<Resolved> {
     let saved = state_dir.join("profile.json");
@@ -280,16 +314,7 @@ fn load_at(selection: &str, state_dir: &Path, root: &Path) -> io::Result<Resolve
     let profile = match selection {
         "mini2" => parse(MINI2)?,
         "generic" => parse(GENERIC)?,
-        path => {
-            let mut text = String::new();
-            fs::File::open(path)?
-                .take(32769)
-                .read_to_string(&mut text)?;
-            if text.len() > 32768 {
-                return Err(invalid("Device profile exceeds 32 KiB"));
-            }
-            parse(&text)?
-        }
+        path => read_file(Path::new(path))?,
     };
     let caps = capabilities(&profile, root);
     Ok(Resolved {
@@ -298,10 +323,11 @@ fn load_at(selection: &str, state_dir: &Path, root: &Path) -> io::Result<Resolve
         source: selection.into(),
     })
 }
-pub fn list() {
-    println!(
-        "auto     System detection or receiver-state/profile.json\nmini2    Yandex Station Mini 2\ngeneric  ALSA audio only; no native IPC or physical controls"
-    );
+pub fn list(state_dir: &Path) -> io::Result<()> {
+    for choice in crate::profile_selection::choices(state_dir)? {
+        println!("{}  {} — {}", choice.key(), choice.name, choice.detail);
+    }
+    Ok(())
 }
 
 #[repr(C)]
