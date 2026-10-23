@@ -72,6 +72,10 @@ fn clock(ms: u32) -> String {
 fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> Vec<String> {
     let state = if !status.connected {
         "CONNECTING"
+    } else if !status.error.is_empty() {
+        "UNAVAILABLE"
+    } else if status.loading {
+        "LOADING"
     } else if !status.active {
         "READY"
     } else if status.paused {
@@ -134,6 +138,9 @@ fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> 
         "x release to Alice   q quit".into(),
         String::new(),
     ];
+    if !status.error.is_empty() {
+        out.push(safe(&status.error));
+    }
     out.extend(notice.lines().map(safe));
     if let Some(input) = prompt {
         out.push(format!(
@@ -311,6 +318,24 @@ pub fn run() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn loading_and_failed_tracks_are_not_shown_as_playing() {
+        let mut status = Status {
+            connected: true,
+            loading: true,
+            ..Default::default()
+        };
+        assert!(
+            lines(&status, "", None, 80)
+                .iter()
+                .any(|s| s.ends_with("|   LOADING"))
+        );
+        status.loading = false;
+        status.error = "Track unavailable".into();
+        let frame = lines(&status, "", None, 80);
+        assert!(frame.iter().any(|s| s.ends_with("|   UNAVAILABLE")));
+        assert!(frame.iter().any(|s| s == "Track unavailable"));
+    }
     #[test]
     fn spectrum_state_is_visible_for_supported_and_other_devices() {
         let mut status = Status::default();

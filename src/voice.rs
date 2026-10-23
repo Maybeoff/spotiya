@@ -248,14 +248,6 @@ pub async fn pause_native() -> io::Result<()> {
     put_number(&mut method, 7, 0);
     send_native(rpc("PlaybackControlCapability", 13, &method)).await
 }
-pub fn guard_native_pause() {
-    tokio::spawn(async {
-        for delay in [200, 300, 500] {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-            let _ = pause_native().await;
-        }
-    });
-}
 pub fn playable_track(text: &str) -> Option<String> {
     use librespot::core::spotify_uri::SpotifyUri;
     let uri = SpotifyUri::from_uri(text.trim()).ok()?;

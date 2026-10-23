@@ -58,6 +58,62 @@ mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicUsize};
     #[tokio::test(start_paused = true)]
+    async fn loading_and_unavailable_tracks_release_native_music_guard() {
+        use librespot::{core::SpotifyUri, playback::player::PlayerEvent};
+        let guard = Arc::new(AudioGuard::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker = {
+            let g = guard.clone();
+            let c = calls.clone();
+            tokio::spawn(async move {
+                g.run_with(|| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(()) }
+                })
+                .await;
+            })
+        };
+        let mut state = crate::playback::Playback::default();
+        let track_id = SpotifyUri::from_uri("spotify:track:0000000000000000000001").unwrap();
+        for event in [
+            PlayerEvent::PlayRequestIdChanged { play_request_id: 1 },
+            PlayerEvent::Loading {
+                play_request_id: 1,
+                track_id: track_id.clone(),
+                position_ms: 0,
+            },
+            PlayerEvent::Unavailable {
+                play_request_id: 1,
+                track_id: track_id.clone(),
+            },
+        ] {
+            state.update(&event);
+            guard.set_playing(state.playing());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+        state.update(&PlayerEvent::PlayRequestIdChanged { play_request_id: 2 });
+        state.update(&PlayerEvent::Playing {
+            play_request_id: 2,
+            track_id: track_id.clone(),
+            position_ms: 0,
+        });
+        guard.set_playing(state.playing());
+        tokio::task::yield_now().await;
+        assert!(calls.load(Ordering::SeqCst) > 0);
+        state.update(&PlayerEvent::Unavailable {
+            play_request_id: 2,
+            track_id,
+        });
+        guard.set_playing(state.playing());
+        let stopped = calls.load(Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), stopped);
+        worker.abort();
+    }
+    #[tokio::test(start_paused = true)]
     async fn reclaims_late_native_playback_and_releases_when_paused() {
         let guard = Arc::new(AudioGuard::new());
         let calls = Arc::new(AtomicUsize::new(0));

@@ -23,6 +23,8 @@ pub const STATUS: &str = "/run/spotiya.status";
 pub struct Status {
     pub active: bool,
     pub paused: bool,
+    pub loading: bool,
+    pub error: String,
     pub volume: u16,
     pub connected: bool,
     pub voice: bool,

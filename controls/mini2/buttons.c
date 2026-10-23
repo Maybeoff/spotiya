@@ -221,13 +221,14 @@ int mini2_buttons_run(void) {
             }
             note("button ");
             note(action_names[queue[i]]);
+            int feedback_paused = queue[i] == TOGGLE ? !current_paused : current_paused;
             if (command(queue[i])) {
                 note(" OK\n");
                 wanted = spotify_active();
                 int64_t now = now_us(CLOCK_MONOTONIC);
                 probe_at = now + 300000;
                 if (wanted) {
-                    lights_begin(&lights, queue[i], current_paused, current_volume, current_steps,
+                    lights_begin(&lights, queue[i], feedback_paused, current_volume, current_steps,
                                  now);
                     if (queue[i] == LOUDER || queue[i] == QUIETER)
                         display_show(&display,

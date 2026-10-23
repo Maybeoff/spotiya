@@ -35,6 +35,8 @@ mod audio_guard;
 mod auth;
 mod control;
 mod device;
+mod logging;
+mod playback;
 mod spectrum;
 mod tui;
 mod voice;
@@ -271,7 +273,17 @@ fn instance_lock(dir: &Path) -> io::Result<File> {
     }
     Ok(file)
 }
-fn publish_status(s: &Shared, info: &mut control::Status, last: &mut String) {
+fn publish_status(
+    s: &Shared,
+    playback: &playback::Playback,
+    info: &mut control::Status,
+    last: &mut String,
+) {
+    s.paused.store(playback.paused(), Ordering::Relaxed);
+    s.active.store(playback.active(), Ordering::Release);
+    info.loading = playback.loading();
+    info.error = playback.error().to_owned();
+    info.position_ms = playback.position_ms().min(info.duration_ms);
     info.active = s.active.load(Ordering::Acquire);
     info.paused = s.paused.load(Ordering::Relaxed);
     info.volume = percent(s.volume.load(Ordering::Relaxed));
@@ -291,7 +303,10 @@ async fn stop_connection(
     task: &mut Option<JoinHandle<()>>,
     session: &Session,
     shared: &Shared,
+    playback: &mut playback::Playback,
 ) {
+    playback.reset();
+    shared.paused.store(false, Ordering::Relaxed);
     shared.active.store(false, Ordering::Release);
     if let Some(handle) = spirc.take() {
         let _ = handle.shutdown();
@@ -316,6 +331,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
     let _lock = instance_lock(&options.state_dir)?;
+    logging::init()?;
     let voice_setting = options.state_dir.join("voice-enabled");
     let mut voice_enabled = options.voice
         && fs::read_to_string(&voice_setting)
@@ -429,8 +445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         spectrum_supported,
         ..Default::default()
     };
-    let mut position_at = Instant::now();
-    let mut position_ms = 0u32;
+    let mut playback = playback::Playback::default();
     eprintln!("receiver: ready, integrated buttons/ring/display; one Master volume");
     loop {
         tokio::select! {
@@ -438,12 +453,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _=tokio::signal::ctrl_c()=>break,
             fresh=discovery.next()=>{
                 let Some(fresh)=fresh else { eprintln!("receiver: discovery stopped"); break; };
-                stop_connection(&mut spirc,&mut task,&session,&shared).await;
+                audio_guard.set_playing(false);
+                stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
                 credentials=Some(fresh); retry_at=Instant::now(); backoff=5;
             },
             Some(login)=login_rx.recv()=>{
                 audio_guard.set_playing(false);
-                stop_connection(&mut spirc,&mut task,&session,&shared).await;
+                stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
                 credentials=Some(login.credentials);pending_login=Some(login.completed);
                 retry_at=Instant::now();backoff=5;
             },
@@ -476,14 +492,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             _=async {if let Some(task)=task.as_mut(){let _=task.await;}}, if task.is_some()=>{
-                spirc=None;task=None;session.shutdown();shared.active.store(false,Ordering::Release);
+                spirc=None;task=None;session.shutdown();playback.reset();
                 retry_at=Instant::now()+Duration::from_secs(5);eprintln!("receiver: reconnect scheduled");
             },
             Some(event)=events.recv()=>{
+                if !playback.update(&event) {continue;}
                 match event {
-                    PlayerEvent::Playing{track_id,position_ms:position,..}=>{
-                        position_ms=position;position_at=Instant::now();
-                        shared.active.store(true,Ordering::Release);shared.paused.store(false,Ordering::Relaxed);
+                    PlayerEvent::PlayRequestIdChanged{..}=>{
+                        info.title.clear();info.artist.clear();info.album.clear();info.duration_ms=0;
+                    },
+                    PlayerEvent::Playing{track_id,..}=>{
                         if let Some(uri)=track_id.to_uri().ok().and_then(|s| voice::playable_track(&s))
                             && last_track.as_ref()!=Some(&uri) {
                                 let temp=last_track_file.with_extension("new");
@@ -492,10 +510,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 } else {eprintln!("receiver: could not save last track");}
                             }
                     },
-                    PlayerEvent::Loading{position_ms:position,..}=>{position_ms=position;position_at=Instant::now();shared.active.store(true,Ordering::Release);shared.paused.store(false,Ordering::Relaxed);},
-                    PlayerEvent::Paused{position_ms:position,..}=>{position_ms=position;position_at=Instant::now();shared.active.store(true,Ordering::Release);shared.paused.store(true,Ordering::Relaxed);},
-                    PlayerEvent::Stopped{..}|PlayerEvent::SessionDisconnected{..}=>{shared.active.store(false,Ordering::Release);},
-                    PlayerEvent::PositionChanged{position_ms:position,..}|PlayerEvent::Seeked{position_ms:position,..}=>{position_ms=position;position_at=Instant::now();},
                     PlayerEvent::TrackChanged{audio_item}=>{
                         info.title=audio_item.name;info.duration_ms=audio_item.duration_ms;
                         match audio_item.unique_fields {
@@ -511,7 +525,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(command)=command_rx.recv()=>{
                 let ok=if let Some(handle)=spirc.as_ref().filter(|_| shared.active.load(Ordering::Acquire)) {
                     match command.action {
-                        0=>{let ok=handle.play_pause().is_ok();if ok {shared.paused.fetch_xor(true,Ordering::AcqRel);}ok},
+                        0=>handle.play_pause().is_ok(),
                         1=>handle.next().is_ok(),
                         2=>handle.prev().is_ok(),
                         3|4=>{
@@ -551,6 +565,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     voice::Intent::Release=>{
                         if let Some(handle)=spirc.as_ref(){let _=handle.disconnect(true);}
+                        playback.reset();shared.paused.store(false,Ordering::Relaxed);
                         shared.active.store(false,Ordering::Release);audio_guard.set_playing(false);
                         continue;
                     },
@@ -565,7 +580,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _=handle.activate();
                         let request=LoadRequest::from_context_uri(voice::context(&query),LoadRequestOptions{start_playing:true,..Default::default()});
                         if handle.load(request).is_ok() {eprintln!("voice: Spotify music query queued");}
-                        voice::guard_native_pause();
                     },
                     voice::Intent::Resume if !shared.active.load(Ordering::Acquire) && last_track.is_some()=>{
                         if event.from_voice && voice::cancel_alice().await.is_err() {continue;}
@@ -573,7 +587,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _=handle.activate();
                         let request=LoadRequest::from_tracks(vec![last_track.clone().unwrap()],LoadRequestOptions{start_playing:true,..Default::default()});
                         if handle.load(request).is_ok() {eprintln!("voice: last Spotify track queued");}
-                        voice::guard_native_pause();
                     },
                     intent if shared.active.load(Ordering::Acquire)=>{
                         if event.from_voice {let _=voice::cancel_alice().await;}
@@ -585,7 +598,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             voice::Intent::Previous=>{let _=handle.prev();},
                             _=>{},
                         }
-                        if event.from_voice {voice::guard_native_pause();}
                         eprintln!("voice: Spotify transport command queued");
                     },
                     _=>{},
@@ -600,23 +612,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if player.is_invalid() {eprintln!("receiver: audio worker stopped");break;}
             },
         }
-        let playing =
-            shared.active.load(Ordering::Acquire) && !shared.paused.load(Ordering::Relaxed);
+        let playing = playback.playing();
         audio_guard.set_playing(playing);
         info.connected = spirc.is_some();
         info.native_guard = playing && audio_guard.healthy();
-        info.position_ms = position_ms
-            .saturating_add(if playing {
-                (position_at
-                    .elapsed()
-                    .as_secs()
-                    .min(u64::from(u32::MAX) / 1000)
-                    * 1000) as u32
-            } else {
-                0
-            })
-            .min(info.duration_ms);
-        publish_status(&shared, &mut info, &mut last_status);
+        publish_status(&shared, &playback, &mut info, &mut last_status);
     }
     shared.active.store(false, Ordering::Release);
     shared.running.store(false, Ordering::Release);
@@ -625,7 +625,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     audio_worker.abort();
     voice_control.abort();
     let _ = fs::remove_file(voice::CONTROL);
-    stop_connection(&mut spirc, &mut task, &session, &shared).await;
+    stop_connection(&mut spirc, &mut task, &session, &shared, &mut playback).await;
     if let Some(controls) = controls {
         let _ = controls.join();
     }
@@ -633,7 +633,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tokio::time::timeout(Duration::from_secs(2), discovery.shutdown()).await;
     info.connected = false;
     info.native_guard = false;
-    publish_status(&shared, &mut info, &mut last_status);
+    publish_status(&shared, &playback, &mut info, &mut last_status);
     eprintln!("receiver: stopped");
     Ok(())
 }
