@@ -21,7 +21,7 @@ use std::{
     os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU16, Ordering},
     },
     time::Duration,
@@ -35,6 +35,7 @@ mod audio_guard;
 mod auth;
 mod control;
 mod device;
+mod ducking;
 mod logging;
 mod playback;
 mod recovery;
@@ -54,6 +55,7 @@ struct Shared {
     volume: AtomicU16,
     commands: mpsc::UnboundedSender<Command>,
     spectrum: Arc<spectrum::Spectrum>,
+    ducking: Arc<ducking::Ducking>,
 }
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 
@@ -129,38 +131,63 @@ fn from_percent(value: u16) -> u16 {
 
 struct MasterMixer {
     shared: Arc<Shared>,
+    handle: Mutex<Option<alsa::mixer::Mixer>>,
 }
 impl MasterMixer {
-    fn read(&self) -> Result<u16, alsa::Error> {
-        let mixer = alsa::mixer::Mixer::new("default", false)?;
+    fn with_control<T>(
+        &self,
+        action: impl FnOnce(&alsa::mixer::Selem<'_>) -> Result<T, alsa::Error>,
+    ) -> Result<T, alsa::Error> {
+        let mut handle = self
+            .handle
+            .lock()
+            .map_err(|_| alsa::Error::new("Master lock", libc::EIO))?;
+        if handle.is_none() {
+            *handle = Some(alsa::mixer::Mixer::new("default", true)?);
+        }
+        let result = Self::access(handle.as_ref().unwrap(), action);
+        if result.is_err() {
+            *handle = None;
+        }
+        result
+    }
+    fn access<T>(
+        mixer: &alsa::mixer::Mixer,
+        action: impl FnOnce(&alsa::mixer::Selem<'_>) -> Result<T, alsa::Error>,
+    ) -> Result<T, alsa::Error> {
+        mixer.handle_events()?;
         let control = mixer
             .find_selem(&SelemId::new("Master", 0))
             .ok_or_else(|| alsa::Error::new("Master mixer", libc::ENOENT))?;
-        let (min, max) = control.get_playback_volume_range();
-        let value = control.get_playback_volume(SelemChannelId::FrontLeft)?;
-        if max <= min {
-            return Err(alsa::Error::new("Master range", libc::EINVAL));
-        }
-        Ok(((value - min).clamp(0, max - min) * 65535 / (max - min)) as u16)
+        action(&control)
+    }
+    fn read(&self) -> Result<u16, alsa::Error> {
+        self.with_control(|control| {
+            let (min, max) = control.get_playback_volume_range();
+            let value = control.get_playback_volume(SelemChannelId::FrontLeft)?;
+            if max <= min {
+                return Err(alsa::Error::new("Master range", libc::EINVAL));
+            }
+            Ok(((value - min).clamp(0, max - min) * 65535 / (max - min)) as u16)
+        })
     }
     fn write(&self, volume: u16) -> Result<u16, alsa::Error> {
-        let mixer = alsa::mixer::Mixer::new("default", false)?;
-        let control = mixer
-            .find_selem(&SelemId::new("Master", 0))
-            .ok_or_else(|| alsa::Error::new("Master mixer", libc::ENOENT))?;
-        let (min, max) = control.get_playback_volume_range();
-        if max <= min {
-            return Err(alsa::Error::new("Master range", libc::EINVAL));
-        }
-        let value = min + (i64::from(volume) * (max - min) + 32767) / 65535;
-        control.set_playback_volume_all(value)?;
-        Ok(((value - min) * 65535 / (max - min)) as u16)
+        self.with_control(|control| {
+            let (min, max) = control.get_playback_volume_range();
+            if max <= min {
+                return Err(alsa::Error::new("Master range", libc::EINVAL));
+            }
+            let value = min + (i64::from(volume) * (max - min) + 32767) / 65535;
+            control.set_playback_volume_all(value)?;
+            Ok(((value - min) * 65535 / (max - min)) as u16)
+        })
     }
 }
 impl Mixer for MasterMixer {
     fn open(_: MixerConfig) -> Result<Self, Error> {
         Ok(Self {
             shared: SHARED.get().expect("receiver initialized").clone(),
+            handle: Mutex::new(None),
         })
     }
     fn volume(&self) -> u16 {
@@ -284,7 +311,8 @@ fn publish_status(
     playback: &playback::Playback,
     failures: &recovery::Failures,
     info: &mut control::Status,
-    last: &mut String,
+    last: &mut Vec<u8>,
+    text: &mut Vec<u8>,
 ) {
     s.paused.store(playback.paused(), Ordering::Relaxed);
     s.active.store(playback.active(), Ordering::Release);
@@ -302,15 +330,19 @@ fn publish_status(
     info.paused = s.paused.load(Ordering::Relaxed);
     info.volume = percent(s.volume.load(Ordering::Relaxed));
     info.spectrum = s.spectrum.enabled();
-    let mut text = serde_json::to_string(info).unwrap();
-    text.push('\n');
-    if *last == text {
+    info.ducking = playback.playing() && s.ducking.active();
+    text.clear();
+    serde_json::to_writer(&mut *text, info).unwrap();
+    text.push(b'\n');
+    if last == text {
         return;
     }
-    if fs::write("/run/spotiya.status.new", &text).is_ok() {
-        let _ = fs::rename("/run/spotiya.status.new", "/run/spotiya.status");
+    if fs::write("/run/spotiya.status.new", &*text)
+        .and_then(|_| fs::rename("/run/spotiya.status.new", "/run/spotiya.status"))
+        .is_ok()
+    {
+        std::mem::swap(last, text);
     }
-    *last = text;
 }
 async fn stop_connection(
     spirc: &mut Option<Spirc>,
@@ -335,15 +367,27 @@ async fn stop_connection(
     session.shutdown();
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         libc::umask(0o077);
-        libc::mallopt(libc::M_ARENA_MAX, 2);
+        libc::mallopt(libc::M_ARENA_MAX, 1);
+        // Player creates its own multi-thread runtime after this single-threaded entry point.
+        if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+            std::env::set_var("TOKIO_WORKER_THREADS", "1");
+        }
     }
     let Some(options) = options().map_err(io::Error::other)? else {
         return Ok(());
     };
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(2)
+        .thread_stack_size(512 * 1024)
+        .thread_keep_alive(Duration::from_secs(2))
+        .build()?
+        .block_on(run(options))
+}
+async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     if options.supervise {
         supervisor::run(&options).await?;
         return Ok(());
@@ -391,10 +435,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         volume: AtomicU16::new(0),
         commands,
         spectrum: Arc::new(spectrum::Spectrum::new(spectrum_enabled)),
+        ducking: Arc::new(ducking::Ducking::new()),
     });
     let _ = SHARED.set(shared.clone());
     let mixer = Arc::new(MasterMixer {
         shared: shared.clone(),
+        handle: Mutex::new(None),
     });
     let initial = mixer.read()?;
     shared.volume.store(initial, Ordering::Relaxed);
@@ -406,6 +452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let backend = audio_backend::find(Some("alsa".into())).expect("ALSA compiled");
     let visual = shared.spectrum.clone();
+    let ducking = shared.ducking.clone();
     let player = Player::new(
         player_config,
         session.clone(),
@@ -414,12 +461,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Box::new(spectrum::VisualSink::new(
                 backend(Some("default".into()), AudioFormat::S16),
                 visual.clone(),
+                ducking.clone(),
             ))
         },
     );
     let mut events = player.get_player_event_channel();
     let (voice_tx, mut voice_rx) = mpsc::channel(8);
-    let voice_watch = tokio::spawn(voice::watch(voice_tx.clone()));
+    let voice_watch = tokio::spawn(voice::watch(voice_tx.clone(), shared.ducking.clone()));
     let (login_tx, mut login_rx) = mpsc::channel::<auth::Login>(1);
     let control_config = config.clone();
     let voice_control = tokio::spawn(async move {
@@ -456,7 +504,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut pending_login = None::<tokio::sync::oneshot::Sender<Result<(), &'static str>>>;
-    let mut last_status = String::new();
+    let mut last_status = Vec::new();
+    let mut status_buffer = Vec::new();
     let mut info = control::Status {
         name: options.name.clone(),
         voice: voice_enabled,
@@ -466,6 +515,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut playback = playback::Playback::default();
     let mut failures = recovery::Failures::default();
     let mut retry_track = None::<String>;
+    let mut reclaim_at = Instant::now() + Duration::from_secs(30);
     eprintln!("receiver: ready, integrated buttons/ring/display; one Master volume");
     loop {
         tokio::select! {
@@ -580,7 +630,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             retry_track=Some(uri);retry_at=Instant::now();backoff=5;
                             eprintln!("receiver: explicit retry scheduled");
                         } else {eprintln!("receiver: retry unavailable or cooling down");}
-                        publish_status(&shared,&playback,&failures,&mut info,&mut last_status);
+                        publish_status(&shared,&playback,&failures,&mut info,&mut last_status,&mut status_buffer);
                         continue;
                     },
                     voice::Intent::Voice(enabled)=>{
@@ -645,6 +695,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             _=tick.tick()=>{
+                if !playback.playing() && Instant::now() >= reclaim_at {
+                    unsafe { libc::malloc_trim(0); }
+                    reclaim_at=Instant::now()+Duration::from_secs(30);
+                }
                 if let Ok(value)=mixer.read() {
                     let previous=shared.volume.swap(value,Ordering::AcqRel);
                     if value!=previous && shared.active.load(Ordering::Acquire)
@@ -657,7 +711,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audio_guard.set_playing(playing);
         info.connected = spirc.is_some();
         info.native_guard = playing && audio_guard.healthy();
-        publish_status(&shared, &playback, &failures, &mut info, &mut last_status);
+        publish_status(
+            &shared,
+            &playback,
+            &failures,
+            &mut info,
+            &mut last_status,
+            &mut status_buffer,
+        );
     }
     shared.active.store(false, Ordering::Release);
     shared.running.store(false, Ordering::Release);
@@ -674,7 +735,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tokio::time::timeout(Duration::from_secs(2), discovery.shutdown()).await;
     info.connected = false;
     info.native_guard = false;
-    publish_status(&shared, &playback, &failures, &mut info, &mut last_status);
+    publish_status(
+        &shared,
+        &playback,
+        &failures,
+        &mut info,
+        &mut last_status,
+        &mut status_buffer,
+    );
     eprintln!("receiver: stopped");
     Ok(())
 }
@@ -703,6 +771,7 @@ mod tests {
             volume: AtomicU16::new(from_percent(37)),
             commands,
             spectrum: Arc::new(spectrum::Spectrum::new(false)),
+            ducking: Arc::new(ducking::Ducking::new()),
         });
         assert!(SHARED.set(shared.clone()).is_ok());
         assert_eq!(mini2_receiver_command(0), 0);

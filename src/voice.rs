@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, io, time::Duration};
+use std::{collections::VecDeque, io, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -116,7 +116,7 @@ pub fn intent(text: &str) -> Option<Intent> {
 }
 
 // QuasarMessage uses {252: serialized payload, 253: message type}.
-// Only the AliceState fields needed for a *final* voice recognition are read.
+// Read AliceState activity and final voice recognition without retaining other payloads.
 fn varint(data: &[u8], offset: &mut usize) -> Option<u64> {
     let mut value = 0u64;
     for shift in (0..70).step_by(7) {
@@ -183,6 +183,17 @@ fn number(data: &[u8], field_number: u64) -> Option<u64> {
         None
     }
 }
+fn alice_busy(data: &[u8]) -> Option<bool> {
+    if number(data, 253) != Some(3) {
+        return None;
+    }
+    let state = bytes(data, 252)?;
+    match number(state, 1).unwrap_or(0) {
+        0 | 6 => Some(false),        // IDLE / NONE
+        1 | 2 | 3 | 5 => Some(true), // LISTENING / SPEAKING / BUSY / SHAZAM
+        _ => None,
+    }
+}
 fn recognized(data: &[u8]) -> Option<(String, String)> {
     if number(data, 253) != Some(3) {
         return None;
@@ -190,7 +201,7 @@ fn recognized(data: &[u8]) -> Option<(String, String)> {
     let state = bytes(data, 252)?;
     if number(state, 1) != Some(3) {
         return None;
-    } // final recognition / THINKING
+    } // final recognition / BUSY
     let result = bytes(state, 15)?;
     if number(result, 2) != Some(1) || number(result, 4) != Some(1) {
         return None;
@@ -266,41 +277,56 @@ async fn send_native(frame: Vec<u8>) -> io::Result<()> {
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "native command timeout"))?
 }
-pub async fn watch(sender: mpsc::Sender<Event>) {
+async fn read_events(
+    socket: &mut (impl tokio::io::AsyncRead + Unpin),
+    sender: &mpsc::Sender<Event>,
+    ducking: &crate::ducking::Ducking,
+    seen: &mut VecDeque<String>,
+) -> io::Result<()> {
+    let mut data = Vec::with_capacity(4096);
+    loop {
+        let size = socket.read_u32_le().await? as usize;
+        if size == 0 || size > MAX_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "native frame length",
+            ));
+        }
+        data.resize(size, 0);
+        socket.read_exact(&mut data).await?;
+        if let Some(busy) = alice_busy(&data) {
+            ducking.set_busy(busy);
+        }
+        if let Some((request, text)) = recognized(&data)
+            && !seen.contains(&request)
+        {
+            seen.push_back(request);
+            if seen.len() > 64 {
+                seen.pop_front();
+            }
+            if let Some(intent) = intent(&text) {
+                let _ = sender.try_send(Event {
+                    intent,
+                    received: Instant::now(),
+                    from_voice: true,
+                });
+            }
+        }
+        if data.capacity() > 64 * 1024 {
+            data = Vec::with_capacity(4096);
+        }
+    }
+}
+pub async fn watch(sender: mpsc::Sender<Event>, ducking: Arc<crate::ducking::Ducking>) {
     let mut seen: VecDeque<String> = VecDeque::new();
     loop {
         let result: io::Result<()> = async {
             let mut socket = TcpStream::connect(ALICE).await?;
             eprintln!("voice: connected to native Alice events");
-            loop {
-                let size = socket.read_u32_le().await? as usize;
-                if size == 0 || size > MAX_FRAME {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "native frame length",
-                    ));
-                }
-                let mut data = vec![0; size];
-                socket.read_exact(&mut data).await?;
-                if let Some((request, text)) = recognized(&data) {
-                    if seen.contains(&request) {
-                        continue;
-                    }
-                    seen.push_back(request);
-                    if seen.len() > 64 {
-                        seen.pop_front();
-                    }
-                    if let Some(intent) = intent(&text) {
-                        let _ = sender.try_send(Event {
-                            intent,
-                            received: Instant::now(),
-                            from_voice: true,
-                        });
-                    }
-                }
-            }
+            read_events(&mut socket, &sender, &ducking, &mut seen).await
         }
         .await;
+        ducking.set_busy(false);
         if sender.is_closed() {
             return;
         }
@@ -330,6 +356,59 @@ pub fn context(query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn state_message(state: Option<u64>, kind: u64) -> Vec<u8> {
+        let mut body = Vec::new();
+        if let Some(state) = state {
+            put_number(&mut body, 1, state);
+        }
+        let mut msg = Vec::new();
+        put_bytes(&mut msg, 252, &body);
+        put_number(&mut msg, 253, kind);
+        msg
+    }
+    #[test]
+    fn alice_activity_includes_listening_thinking_and_speech_only() {
+        for state in [0, 6] {
+            assert_eq!(alice_busy(&state_message(Some(state), 3)), Some(false));
+        }
+        for state in [1, 2, 3, 5] {
+            assert_eq!(alice_busy(&state_message(Some(state), 3)), Some(true));
+        }
+        assert_eq!(alice_busy(&state_message(None, 3)), Some(false));
+        assert_eq!(alice_busy(&state_message(Some(99), 3)), None);
+        assert_eq!(alice_busy(&state_message(Some(1), 210)), None);
+        assert_eq!(alice_busy(&[]), None);
+    }
+    #[tokio::test]
+    async fn framed_alice_events_duck_without_dispatching_transport_commands() {
+        let (mut client, mut server) = tokio::io::duplex(2048);
+        let (sender, mut commands) = mpsc::channel(8);
+        let duck = Arc::new(crate::ducking::Ducking::new());
+        let observed = duck.clone();
+        let reader = tokio::spawn(async move {
+            let result = read_events(&mut server, &sender, &observed, &mut VecDeque::new()).await;
+            observed.set_busy(false);
+            result
+        });
+        for (state, busy) in [(1, true), (3, true), (2, true), (0, false), (1, true)] {
+            let msg = state_message(Some(state), 3);
+            client.write_u32_le(msg.len() as u32).await.unwrap();
+            for fragment in msg.chunks(3) {
+                client.write_all(fragment).await.unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while duck.active() != busy {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert!(commands.try_recv().is_err());
+        drop(client);
+        assert!(reader.await.unwrap().is_err());
+        assert!(!duck.active());
+    }
     #[test]
     fn recognizes_music_and_leaves_household_commands_alone() {
         assert_eq!(

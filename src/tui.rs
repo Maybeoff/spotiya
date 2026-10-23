@@ -106,8 +106,15 @@ fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> 
         String::new(),
         format!("{}   |   {}", safe(&status.name), state),
         format!(
-            "Volume {:3}%   Voice {}   Audio: {}",
-            status.volume, voice, guard
+            "Volume {:3}%   Voice {}   Audio: {}{}",
+            status.volume,
+            voice,
+            guard,
+            if status.ducking {
+                "   Alice: ducked"
+            } else {
+                ""
+            }
         ),
         format!(
             "Spectrum: {}",

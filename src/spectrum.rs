@@ -154,14 +154,22 @@ pub struct VisualSink {
     spectrum: Arc<Spectrum>,
     analyzer: Analyzer,
     analyzing: bool,
+    ducking: Arc<crate::ducking::Ducking>,
+    gain: crate::ducking::Gain,
 }
 impl VisualSink {
-    pub fn new(inner: Box<dyn Sink>, spectrum: Arc<Spectrum>) -> Self {
+    pub fn new(
+        inner: Box<dyn Sink>,
+        spectrum: Arc<Spectrum>,
+        ducking: Arc<crate::ducking::Ducking>,
+    ) -> Self {
         Self {
             inner,
             spectrum,
             analyzer: Analyzer::new(),
             analyzing: false,
+            ducking,
+            gain: crate::ducking::Gain::new(),
         }
     }
 }
@@ -176,7 +184,7 @@ impl Sink for VisualSink {
         self.spectrum.clear();
         self.inner.stop()
     }
-    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
+    fn write(&mut self, mut packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
         let enabled = self.spectrum.enabled();
         if enabled {
             if !self.analyzing {
@@ -187,6 +195,9 @@ impl Sink for VisualSink {
             }
         }
         self.analyzing = enabled;
+        if let AudioPacket::Samples(samples) = &mut packet {
+            self.gain.apply(samples, self.ducking.active());
+        }
         self.inner.write(packet, converter)
     }
 }
@@ -256,7 +267,11 @@ mod tests {
         }
         let output = Rc::new(RefCell::new(Vec::new()));
         let spectrum = Arc::new(Spectrum::new(true));
-        let mut sink = VisualSink::new(Box::new(Capture(output.clone())), spectrum.clone());
+        let mut sink = VisualSink::new(
+            Box::new(Capture(output.clone())),
+            spectrum.clone(),
+            Arc::new(crate::ducking::Ducking::new()),
+        );
         let samples = tone(100.0, false);
         let mut converter = Converter::new(None);
         sink.write(AudioPacket::Samples(samples.clone()), &mut converter)
@@ -265,5 +280,38 @@ mod tests {
         assert!(spectrum.frame().is_some());
         sink.stop().unwrap();
         assert!(spectrum.frame().is_none());
+    }
+    #[test]
+    fn ducking_changes_only_spotify_pcm_in_place_and_restores_it() {
+        use std::{cell::RefCell, rc::Rc};
+        struct Capture(Rc<RefCell<Vec<f64>>>);
+        impl Sink for Capture {
+            fn write(&mut self, packet: AudioPacket, _: &mut Converter) -> SinkResult<()> {
+                *self.0.borrow_mut() = match packet {
+                    AudioPacket::Samples(samples) => samples,
+                    _ => panic!("expected PCM"),
+                };
+                Ok(())
+            }
+        }
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let ducking = Arc::new(crate::ducking::Ducking::new());
+        let mut sink = VisualSink::new(
+            Box::new(Capture(output.clone())),
+            Arc::new(Spectrum::new(false)),
+            ducking.clone(),
+        );
+        let samples = vec![0.5; 10000];
+        let pointer = samples.as_ptr();
+        ducking.set_busy(true);
+        let mut converter = Converter::new(None);
+        sink.write(AudioPacket::Samples(samples), &mut converter)
+            .unwrap();
+        assert_eq!(output.borrow().as_ptr(), pointer);
+        assert_eq!(output.borrow()[9999], 0.1);
+        ducking.set_busy(false);
+        sink.write(AudioPacket::Samples(vec![0.5; 30000]), &mut converter)
+            .unwrap();
+        assert_eq!(output.borrow()[29999], 0.5);
     }
 }

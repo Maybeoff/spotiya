@@ -32,6 +32,7 @@ pub struct Status {
     pub connected: bool,
     pub voice: bool,
     pub native_guard: bool,
+    pub ducking: bool,
     pub spectrum: bool,
     pub spectrum_supported: bool,
     pub title: String,

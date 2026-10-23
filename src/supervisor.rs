@@ -47,6 +47,7 @@ fn offline_status(config: &Config, message: &str) {
     status.loading = false;
     status.connected = false;
     status.native_guard = false;
+    status.ducking = false;
     status.retry_required = false;
     status.retry_after_secs = 0;
     status.failed_tracks = 0;
