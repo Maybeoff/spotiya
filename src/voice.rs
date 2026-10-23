@@ -115,6 +115,44 @@ pub fn intent(text: &str) -> Option<Intent> {
     Some(Intent::Play(query.to_owned()))
 }
 
+fn native_volume_request(text: &str) -> bool {
+    let normalized = text.trim().to_lowercase().replace('ё', "е");
+    let text = normalized.strip_prefix("алиса, ").unwrap_or(&normalized);
+    let mut words = text.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    if matches!(
+        first.trim_end_matches(['.', '!', '?']),
+        "громче" | "тише" | "погромче" | "потише"
+    ) {
+        return true;
+    }
+    if first == "громкость" {
+        return words.next().is_some();
+    }
+    matches!(
+        first,
+        "сделай"
+            | "поставь"
+            | "установи"
+            | "измени"
+            | "увеличь"
+            | "уменьши"
+            | "добавь"
+            | "убавь"
+            | "прибавь"
+            | "включи"
+            | "выключи"
+            | "отключи"
+    ) && words.next().is_some_and(|word| {
+        matches!(
+            word,
+            "звук" | "громкость" | "громче" | "тише" | "погромче" | "потише"
+        )
+    })
+}
+
 // QuasarMessage uses {252: serialized payload, 253: message type}.
 // Read AliceState activity and final voice recognition without retaining other payloads.
 fn varint(data: &[u8], offset: &mut usize) -> Option<u64> {
@@ -304,6 +342,9 @@ async fn read_events(
             if seen.len() > 64 {
                 seen.pop_front();
             }
+            if native_volume_request(&text) {
+                ducking.volume.native_command();
+            }
             if let Some(intent) = intent(&text) {
                 let _ = sender.try_send(Event {
                     intent,
@@ -356,6 +397,32 @@ pub fn context(query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_volume_commands_are_distinct_from_music_and_questions() {
+        for text in [
+            "громче",
+            "тише!",
+            "погромче",
+            "громкость пять",
+            "громкость на 30 процентов",
+            "сделай потише",
+            "увеличь громкость",
+            "выключи звук",
+            "Алиса, установи громкость 3",
+        ] {
+            assert!(native_volume_request(text), "{text}");
+        }
+        for text in [
+            "какая погода",
+            "какая сейчас громкость",
+            "почему музыка тихая",
+            "включи песню Тише",
+            "включи Radiohead",
+            "поставь таймер",
+        ] {
+            assert!(!native_volume_request(text), "{text}");
+        }
+    }
     fn state_message(state: Option<u64>, kind: u64) -> Vec<u8> {
         let mut body = Vec::new();
         if let Some(state) = state {

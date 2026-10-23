@@ -12,12 +12,14 @@ const RELEASE_FRAMES: f64 = librespot::playback::SAMPLE_RATE as f64 * 0.3;
 pub struct Ducking {
     origin: Instant,
     until: AtomicU32,
+    pub volume: crate::volume_guard::VolumeGuard,
 }
 impl Ducking {
     pub fn new() -> Self {
         Self {
             origin: Instant::now(),
             until: AtomicU32::new(0),
+            volume: crate::volume_guard::VolumeGuard::new(),
         }
     }
     pub fn set_busy(&self, busy: bool) {
@@ -29,6 +31,7 @@ impl Ducking {
             0
         };
         self.until.store(until, Ordering::Release);
+        self.volume.activity(busy);
     }
     pub fn active(&self) -> bool {
         let until = self.until.load(Ordering::Acquire);

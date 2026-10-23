@@ -43,6 +43,7 @@ mod spectrum;
 mod supervisor;
 mod tui;
 mod voice;
+mod volume_guard;
 
 struct Command {
     action: i32,
@@ -191,10 +192,20 @@ impl Mixer for MasterMixer {
         })
     }
     fn volume(&self) -> u16 {
+        if self.shared.ducking.volume.holding() {
+            return self.shared.volume.load(Ordering::Acquire);
+        }
         self.read()
             .unwrap_or_else(|_| self.shared.volume.load(Ordering::Relaxed))
     }
     fn set_volume(&self, value: u16) {
+        if value != self.shared.volume.load(Ordering::Acquire) {
+            self.shared.ducking.volume.spotify_command();
+        }
+        if self.shared.ducking.volume.holding() {
+            self.shared.volume.store(value, Ordering::Release);
+            return;
+        }
         if let Ok(actual) = self.write(value) {
             self.shared.volume.store(actual, Ordering::Release);
         } else {
@@ -327,6 +338,8 @@ fn publish_status(
     };
     info.position_ms = playback.position_ms().min(info.duration_ms);
     info.active = s.active.load(Ordering::Acquire);
+    s.ducking.volume.set_enabled(info.active);
+    s.ducking.volume.activity(s.ducking.active());
     info.paused = s.paused.load(Ordering::Relaxed);
     info.volume = percent(s.volume.load(Ordering::Relaxed));
     info.spectrum = s.spectrum.enabled();
@@ -699,10 +712,22 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                     unsafe { libc::malloc_trim(0); }
                     reclaim_at=Instant::now()+Duration::from_secs(30);
                 }
+                let guard=&shared.ducking.volume;
+                guard.set_enabled(playback.active());guard.activity(shared.ducking.active());
                 if let Ok(value)=mixer.read() {
-                    let previous=shared.volume.swap(value,Ordering::AcqRel);
-                    if value!=previous && shared.active.load(Ordering::Acquire)
-                        && let Some(handle)=spirc.as_ref() {let _=handle.set_volume(value);}
+                    if guard.holding() {
+                        let desired=shared.volume.load(Ordering::Acquire);
+                        if let Some(target)=guard.restore_target(value,desired)
+                            && let Ok(actual)=if target==value {Ok(value)} else {mixer.write(target)} {
+                                shared.volume.store(actual,Ordering::Release);guard.restored();
+                                if let Some(handle)=spirc.as_ref(){let _=handle.set_volume(actual);}
+                                eprintln!("volume: restored after Alice conversation");
+                        }
+                    } else {
+                        let previous=shared.volume.swap(value,Ordering::AcqRel);
+                        if value!=previous && shared.active.load(Ordering::Acquire)
+                            && let Some(handle)=spirc.as_ref() {let _=handle.set_volume(value);}
+                    }
                 }
                 if player.is_invalid() {eprintln!("receiver: audio worker stopped");break;}
             },
