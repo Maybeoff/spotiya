@@ -1,6 +1,6 @@
 [package]
 name = "spotiya"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 license = "MIT"
 description = "Spotify Connect and voice control for Yandex Stations"
@@ -20,6 +20,10 @@ oauth2 = { version = "5", default-features = false, features = ["reqwest", "rust
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt", "process", "macros", "signal", "sync", "time"] }
+
+sha2 = "0.10"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tar = { version = "0.4", default-features = false }
 
 [build-dependencies]
 cc = "1"

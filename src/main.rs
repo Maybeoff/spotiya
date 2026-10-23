@@ -35,7 +35,9 @@ mod audio_guard;
 mod auth;
 mod control;
 mod device;
+mod doctor;
 mod ducking;
+mod installation;
 mod logging;
 mod playback;
 mod profile_selection;
@@ -44,6 +46,7 @@ mod recovery;
 mod spectrum;
 mod supervisor;
 mod tui;
+mod update;
 mod voice;
 mod volume_guard;
 
@@ -244,6 +247,14 @@ fn options() -> Result<Option<Options>, String> {
     let mut profile_info = false;
     let mut profile_list = false;
     let mut profile_select = None;
+    let mut doctor = false;
+    let mut doctor_report: Option<PathBuf> = None;
+    let mut update = false;
+    let mut update_check = false;
+    let mut update_tag = None;
+    let mut update_file = None;
+    let mut install_root = None;
+    let mut install_binary = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--state-dir" => {
@@ -257,6 +268,41 @@ fn options() -> Result<Option<Options>, String> {
             "--profiles" => profile_list = true,
             "--profile-select" => {
                 profile_select = Some(args.next().ok_or("missing profile id or JSON path")?)
+            }
+            "--doctor" => doctor = true,
+            "--doctor-report" => {
+                doctor = true;
+                let path = args
+                    .next()
+                    .ok_or("missing report path; use - for an automatic path")?;
+                doctor_report = Some(if path == "-" {
+                    std::env::temp_dir()
+                        .join(format!("spotiya-doctor-{}.json", uuid::Uuid::new_v4()))
+                } else {
+                    path.into()
+                });
+            }
+            "--update" => update = true,
+            "--update-check" => {
+                update = true;
+                update_check = true;
+            }
+            "--update-tag" => {
+                update = true;
+                update_tag = Some(args.next().ok_or("missing release version")?);
+            }
+            "--update-file" => {
+                update = true;
+                update_file = Some((
+                    PathBuf::from(args.next().ok_or("missing archive path")?),
+                    PathBuf::from(args.next().ok_or("missing SHA256SUMS path")?),
+                ));
+            }
+            "--install" => {
+                install_root = Some(PathBuf::from(args.next().ok_or("missing package root")?))
+            }
+            "--install-binary" => {
+                install_binary = Some(PathBuf::from(args.next().ok_or("missing binary path")?))
             }
             "--supervise" => result.supervise = true,
             "--no-buttons" => result.buttons = false,
@@ -317,12 +363,52 @@ fn options() -> Result<Option<Options>, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --login | --status | --version\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --release | --retry"
+                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --release | --retry"
                 );
                 return Ok(None);
             }
             _ => return Err(format!("unknown option: {arg}")),
         }
+    }
+    if [
+        doctor,
+        update,
+        install_root.is_some(),
+        profile_select.is_some(),
+        profile_list,
+        profile_info,
+    ]
+    .into_iter()
+    .filter(|v| *v)
+    .count()
+        > 1
+    {
+        return Err("Choose one maintenance operation per command".into());
+    }
+    if doctor {
+        doctor::run(&result.state_dir, doctor_report.as_deref()).map_err(|e| e.to_string())?;
+        return Ok(None);
+    }
+    if update {
+        if let Some((archive, sums)) = update_file {
+            if update_check || update_tag.is_some() {
+                return Err("Local update cannot be combined with release options".into());
+            }
+            update::local(&archive, &sums).map_err(|e| e.to_string())?;
+        } else {
+            update::remote(update_check, update_tag.as_deref()).map_err(|e| e.to_string())?;
+        }
+        return Ok(None);
+    }
+    if let Some(root) = install_root {
+        let root = fs::canonicalize(root).map_err(|e| e.to_string())?;
+        let binary = fs::canonicalize(install_binary.unwrap_or_else(|| root.join("spotiya")))
+            .map_err(|e| e.to_string())?;
+        installation::install(&root, &binary, false).map_err(|e| e.to_string())?;
+        return Ok(None);
+    }
+    if install_binary.is_some() {
+        return Err("--install-binary requires --install".into());
     }
     if let Some(choice) = profile_select {
         println!(

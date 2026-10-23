@@ -5,6 +5,21 @@ case "${1:-tui}" in
     start|stop|restart)
         exec /etc/init.d/S99spotify-connect "$1"
         ;;
+    doctor)
+        shift
+        if [ "$#" -eq 0 ]; then set -- --doctor
+        elif [ "$1" = report ] && [ "$#" -le 2 ]; then set -- --doctor-report "${2:--}"
+        else echo 'Usage: spotiya doctor [report [FILE]]' >&2; exit 1; fi
+        ;;
+    update)
+        shift
+        case "${1:-}" in
+            '') set -- --update ;;
+            check) [ "$#" -eq 1 ] || exit 1; set -- --update-check ;;
+            file) [ "$#" -eq 3 ] || { echo 'Usage: spotiya update file ARCHIVE SHA256SUMS' >&2; exit 1; }; set -- --update-file "$2" "$3" ;;
+            *) [ "$#" -eq 1 ] || { echo 'Usage: spotiya update [check|VERSION|file ARCHIVE SHA256SUMS]' >&2; exit 1; }; set -- --update-tag "$1" ;;
+        esac
+        ;;
     play)
         shift
         [ "$#" -gt 0 ] || { echo 'Usage: spotiya play SONG_OR_ARTIST' >&2; exit 1; }

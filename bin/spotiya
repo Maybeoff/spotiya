@@ -44,7 +44,7 @@ def main():
     parser.add_argument("--device", default=configured_device(), help="ADB serial/IP; otherwise configured or only connected device")
     parser.add_argument("command", nargs="?", default="tui", choices=(
         "tui", "login", "status", "play", "pause", "resume", "toggle", "next",
-        "previous", "volume", "voice", "spectrum", "retry", "release", "start", "stop", "restart", "version", "profile", "profiles"))
+        "previous", "volume", "voice", "spectrum", "retry", "release", "start", "stop", "restart", "version", "profile", "profiles", "doctor", "update"))
     parser.add_argument("value", nargs="*")
     args = parser.parse_args()
     if args.command == "play":
@@ -55,6 +55,24 @@ def main():
         if len(args.value) != 1:
             parser.error(args.command + " needs one value")
         value = args.value
+    elif args.command == "doctor":
+        if not args.value:
+            value = []
+        elif args.value[0] == "report" and len(args.value) <= 2:
+            value = [args.value[1] if len(args.value) == 2 else "-"]
+        else:
+            parser.error("doctor accepts: report [REMOTE_FILE]")
+    elif args.command == "update":
+        if not args.value:
+            value = []
+        elif args.value == ["check"]:
+            value = []
+        elif len(args.value) == 3 and args.value[0] == "file":
+            value = args.value[1:]
+        elif len(args.value) == 1:
+            value = args.value
+        else:
+            parser.error("update accepts: check, VERSION, or file REMOTE_ARCHIVE REMOTE_SHA256SUMS")
     elif args.command == "profile":
         if not args.value:
             value = []
@@ -71,11 +89,15 @@ def main():
         os.execvp("adb", adb + ["shell", shlex.join(["/etc/init.d/S99spotify-connect", args.command])])
     if args.command == "tui" and not sys.stdin.isatty():
         parser.error("tui needs an interactive terminal")
-    if args.command not in ("status", "version", "profile", "profiles"):
+    if args.command not in ("status", "version", "profile", "profiles", "doctor", "update"):
         start = subprocess.run(adb + ["shell", shlex.join([BASE + "/start.sh"])], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if start.returncode or not any(s in start.stdout for s in ("already running", "Connect started")):
             sys.exit(start.stdout.strip() or "Unable to start receiver")
     remote_command = ("profile-select" if value else "profile-info") if args.command == "profile" else args.command
+    if args.command == "doctor" and value:
+        remote_command = "doctor-report"
+    elif args.command == "update":
+        remote_command = "update-file" if len(value) == 2 else ("update-tag" if value else ("update-check" if args.value else "update"))
     remote = shlex.join([BASE + "/spotiya", "--" + remote_command] + value)
     if args.command == "tui":
         columns, rows = shutil.get_terminal_size(fallback=(80, 24))
