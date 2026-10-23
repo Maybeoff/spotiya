@@ -10,7 +10,11 @@ case "${1:-tui}" in
         [ "$#" -gt 0 ] || { echo 'Usage: spotiya play SONG_OR_ARTIST' >&2; exit 1; }
         set -- --play "$*"
         ;;
-    tui|login|status|pause|resume|toggle|next|previous|volume|voice|spectrum|retry|release|version|help)
+    profile)
+        shift
+        set -- --profile-info "$@"
+        ;;
+    tui|login|status|pause|resume|toggle|next|previous|volume|voice|spectrum|retry|release|version|help|profiles)
         SPOTIYA_COMMAND=${1:-tui}
         [ "$#" -eq 0 ] || shift
         set -- "--$SPOTIYA_COMMAND" "$@"

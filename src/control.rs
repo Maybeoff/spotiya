@@ -31,6 +31,8 @@ pub struct Status {
     pub volume: u16,
     pub connected: bool,
     pub voice: bool,
+    pub voice_supported: bool,
+    pub profile: String,
     pub native_guard: bool,
     pub ducking: bool,
     pub spectrum: bool,
@@ -74,7 +76,7 @@ pub async fn serve(
     sender: mpsc::Sender<Event>,
     logins: mpsc::Sender<auth::Login>,
     config: SessionConfig,
-    spectrum_supported: bool,
+    capabilities: crate::profiles::Capabilities,
 ) -> io::Result<()> {
     let _ = fs::remove_file(voice::CONTROL);
     let listener = UnixListener::bind(voice::CONTROL)?;
@@ -131,7 +133,9 @@ pub async fn serve(
                     )
                 {
                     "ERROR Playback stopped after repeated failures; use retry\n".into()
-                } else if matches!(intent, Intent::Spectrum(_)) && !spectrum_supported {
+                } else if matches!(intent, Intent::Voice(_)) && !capabilities.voice {
+                    "ERROR Voice control is unavailable in this device profile\n".into()
+                } else if matches!(intent, Intent::Spectrum(_)) && !capabilities.display {
                     "ERROR Spectrum display is unavailable on this device\n".into()
                 } else if sender
                     .try_send(Event {

@@ -9,16 +9,15 @@
 #include <unistd.h>
 
 static char test_root[128];
-#define LED_ROOT test_root
+static char test_ring_prefix[160], test_display_prefix[160];
 #include "lights.h"
 #include "display.h"
 static void clock_path(char *path, size_t size, int i) {
     static const char *extra[] = {"PLUS1", "PLUS2", "PLUS3", "PLUS4", "MINUS", "DEGREE"};
     if (i < 28)
-        snprintf(path, size, "%smini2:white:clock%c%d/brightness", test_root, 'A' + i % 7,
-                 i / 7 + 1);
+        snprintf(path, size, "%stest-clock%c%d/brightness", test_root, 'A' + i % 7, i / 7 + 1);
     else
-        snprintf(path, size, "%smini2:white:clock%s/brightness", test_root, extra[i - 28]);
+        snprintf(path, size, "%stest-clock%s/brightness", test_root, extra[i - 28]);
 }
 static int clock_value(int i) {
     char path[256];
@@ -48,7 +47,7 @@ static unsigned clock_digit(int place) {
 }
 static void path_for(char *path, size_t size, int i) {
     const char *color = i < 6 ? "red" : i < 12 ? "green" : "blue";
-    snprintf(path, size, "%smini2:%s:ring%d/brightness", test_root, color, i % 6 + 1);
+    snprintf(path, size, "%stest-led-%s:ring%d/brightness", test_root, color, i % 6 + 1);
 }
 static int brightness(int i) {
     char path[256];
@@ -74,6 +73,10 @@ int main(void) {
     char *dir = mkdtemp(temp);
     assert(dir);
     snprintf(test_root, sizeof test_root, "%s/", dir);
+    snprintf(test_ring_prefix, sizeof test_ring_prefix, "%stest-led-", test_root);
+    snprintf(test_display_prefix, sizeof test_display_prefix, "%stest-clock", test_root);
+    control_config.ring_prefix = test_ring_prefix;
+    control_config.display_prefix = test_display_prefix;
     for (int i = 0; i < 18; i++) {
         char path[256];
         path_for(path, sizeof path, i);
@@ -101,6 +104,9 @@ int main(void) {
     lights_tick(&l, 2060000);
     assert(brightness(0) == 80 && brightness(6) == 26);
     lights_close(&l, 1);
+    control_config.ring_prefix = NULL;
+    assert(!lights_open(&l));
+    control_config.ring_prefix = test_ring_prefix;
     assert(brightness(0) == 0);
     lights_begin(&l, LOUDER, 0, 50, 100, 3000000);
     lights_tick(&l, 3060000);

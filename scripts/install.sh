@@ -9,6 +9,10 @@ SPOTIYA_BINARY=${1:-"$SPOTIYA_ROOT/spotiya"}
 for file in run.sh start.sh stop.sh boot.sh service.sh cli.sh S99spotify-connect; do
     [ -f "$SPOTIYA_ROOT/packaging/$file" ] || { echo "Missing packaging/$file" >&2; exit 1; }
 done
+for profile in mini2 generic; do
+    [ -f "$SPOTIYA_ROOT/profiles/$profile.json" ] || { echo "Missing profiles/$profile.json" >&2; exit 1; }
+done
+"$SPOTIYA_BINARY" --state-dir "$SPOTIYA_BASE/receiver-state" --profile-info >/dev/null
 if [ -e /usr/bin/spotiya ] && [ "$(readlink -f /usr/bin/spotiya)" != "$(readlink -f "$SPOTIYA_BASE/cli.sh")" ]; then
     echo '/usr/bin/spotiya belongs to another installation' >&2
     exit 1
@@ -41,6 +45,8 @@ for file in run.sh start.sh stop.sh boot.sh service.sh cli.sh; do
     cp "$SPOTIYA_ROOT/packaging/$file" "$SPOTIYA_BASE/$file"
     chmod 755 "$SPOTIYA_BASE/$file"
 done
+mkdir -p "$SPOTIYA_BASE/profiles"
+cp "$SPOTIYA_ROOT/profiles/mini2.json" "$SPOTIYA_ROOT/profiles/generic.json" "$SPOTIYA_BASE/profiles/"
 cp "$SPOTIYA_ROOT/packaging/S99spotify-connect" /etc/init.d/S99spotify-connect
 chmod 755 /etc/init.d/S99spotify-connect
 ln -sf "$SPOTIYA_BASE/cli.sh" /usr/bin/spotiya

@@ -1,5 +1,3 @@
-use std::path::Path;
-
 // Use the running system's hostname, including its per-device suffix. Firmware
 // /etc/hostname may contain only a model name and is not the live device name.
 pub fn system_name() -> String {
@@ -25,13 +23,6 @@ fn usable_name(name: &str) -> Option<String> {
         Some(name.to_owned())
     }
 }
-pub fn mini2_controls_available() -> bool {
-    Path::new("/sys/class/leds/mini2:red:ring1").exists()
-}
-pub fn mini2_display_available() -> bool {
-    Path::new("/sys/class/leds/mini2:white:clockA1").exists()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

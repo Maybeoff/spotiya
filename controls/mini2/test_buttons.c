@@ -51,6 +51,13 @@ int main(void) {
     key_event(&g, 248, 1, 1000);
     key_event(&g, 248, 0, 2000);
     assert(queued == 0);
+    control_config.alice = 200;
+    control_config.volume_up = 201;
+    control_config.volume_down = 202;
+    const struct recorded remapped[] = {
+        {1000, 200, 1}, {2000, 201, 1}, {3000, 200, 0}, {4000, 201, 0}};
+    replay(remapped, 4, NEXT);
+    assert(key_index(582) == -1 && key_index(115) == -1 && key_index(114) == -1);
     puts("Recorded gesture traces, separate taps, repeat, privacy key passed.");
     return 0;
 }

@@ -85,7 +85,13 @@ fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> 
     } else {
         "PLAYING"
     };
-    let voice = if status.voice { "on" } else { "off" };
+    let voice = if !status.voice_supported {
+        "unavailable"
+    } else if status.voice {
+        "on"
+    } else {
+        "off"
+    };
     let guard = if status.native_guard {
         "Spotify priority"
     } else {
@@ -105,6 +111,7 @@ fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> 
         ),
         String::new(),
         format!("{}   |   {}", safe(&status.name), state),
+        format!("Profile: {}", safe(&status.profile)),
         format!(
             "Volume {:3}%   Voice {}   Audio: {}{}",
             status.volume,
@@ -268,7 +275,14 @@ pub fn run() -> io::Result<()> {
                 b'p' => Some("PREVIOUS".to_owned()),
                 b'+' | b'=' => Some(format!("VOLUME {}", (status.volume + 5).min(100))),
                 b'-' => Some(format!("VOLUME {}", status.volume.saturating_sub(5))),
-                b'v' => Some(format!("VOICE {}", if status.voice { "OFF" } else { "ON" })),
+                b'v' => {
+                    if status.voice_supported {
+                        Some(format!("VOICE {}", if status.voice { "OFF" } else { "ON" }))
+                    } else {
+                        notice = "Voice control is unavailable in this device profile".into();
+                        None
+                    }
+                }
                 b'e' => {
                     if status.spectrum_supported {
                         Some(format!(

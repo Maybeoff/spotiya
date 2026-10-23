@@ -7,7 +7,7 @@ fn main() {
         .warnings(true)
         .warnings_into_errors(true)
         .compile("mini2_controls");
-    for name in ["buttons.c", "lights.h", "display.h"] {
+    for name in ["buttons.c", "config.h", "lights.h", "display.h"] {
         println!("cargo:rerun-if-changed=controls/mini2/{name}");
     }
 }

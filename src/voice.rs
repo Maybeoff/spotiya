@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, io, sync::Arc, time::Duration};
+use std::{collections::VecDeque, io, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -6,7 +6,6 @@ use tokio::{
     time::Instant,
 };
 
-const ALICE: &str = "127.0.0.1:9875";
 pub const CONTROL: &str = "/run/spotiya.control";
 const MAX_FRAME: usize = 512 * 1024;
 
@@ -281,11 +280,11 @@ fn rpc(capability: &str, field: u64, method: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(&message);
     frame
 }
-pub async fn cancel_alice() -> io::Result<()> {
+pub async fn cancel_alice(address: SocketAddr) -> io::Result<()> {
     // Native CLI 'c': AliceCapabilityMethod kind 3, cancel the conversation.
-    send_native(rpc("AliceCapability", 8, &[8, 3])).await
+    send_native(address, rpc("AliceCapability", 8, &[8, 3])).await
 }
-pub async fn pause_native() -> io::Result<()> {
+pub async fn pause_native(address: SocketAddr) -> io::Result<()> {
     // Native CLI 'o': PlaybackControlCapabilityMethod kind 1 (pause).
     let mut source = Vec::new();
     put_number(&mut source, 1, 14);
@@ -296,7 +295,16 @@ pub async fn pause_native() -> io::Result<()> {
     let mut method = vec![8, 1];
     put_bytes(&mut method, 5, &source);
     put_number(&mut method, 7, 0);
-    send_native(rpc("PlaybackControlCapability", 13, &method)).await
+    send_native(address, rpc("PlaybackControlCapability", 13, &method)).await
+}
+pub async fn prepare_playback(address: Option<SocketAddr>, from_voice: bool) -> io::Result<()> {
+    if let Some(address) = address {
+        if from_voice {
+            cancel_alice(address).await?;
+        }
+        let _ = pause_native(address).await;
+    }
+    Ok(())
 }
 pub fn playable_track(text: &str) -> Option<String> {
     use librespot::core::spotify_uri::SpotifyUri;
@@ -306,9 +314,9 @@ pub fn playable_track(text: &str) -> Option<String> {
         _ => None,
     }
 }
-async fn send_native(frame: Vec<u8>) -> io::Result<()> {
+async fn send_native(address: SocketAddr, frame: Vec<u8>) -> io::Result<()> {
     tokio::time::timeout(Duration::from_millis(500), async {
-        let mut socket = TcpStream::connect(ALICE).await?;
+        let mut socket = TcpStream::connect(address).await?;
         socket.write_all(&frame).await?;
         socket.shutdown().await
     })
@@ -358,11 +366,15 @@ async fn read_events(
         }
     }
 }
-pub async fn watch(sender: mpsc::Sender<Event>, ducking: Arc<crate::ducking::Ducking>) {
+pub async fn watch(
+    sender: mpsc::Sender<Event>,
+    ducking: Arc<crate::ducking::Ducking>,
+    address: SocketAddr,
+) {
     let mut seen: VecDeque<String> = VecDeque::new();
     loop {
         let result: io::Result<()> = async {
-            let mut socket = TcpStream::connect(ALICE).await?;
+            let mut socket = TcpStream::connect(address).await?;
             eprintln!("voice: connected to native Alice events");
             read_events(&mut socket, &sender, &ducking, &mut seen).await
         }
@@ -397,6 +409,34 @@ pub fn context(query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn native_commands_use_the_profile_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let receiver = tokio::spawn(async move {
+            let mut objects = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let size = socket.read_u32_le().await.unwrap();
+                let mut msg = vec![0; size as usize];
+                socket.read_exact(&mut msg).await.unwrap();
+                assert_eq!(number(&msg, 253), Some(210));
+                objects.push(
+                    std::str::from_utf8(bytes(bytes(&msg, 252).unwrap(), 7).unwrap())
+                        .unwrap()
+                        .to_owned(),
+                );
+            }
+            objects
+        });
+        prepare_playback(Some(address), true).await.unwrap();
+        let objects = tokio::time::timeout(Duration::from_secs(2), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(objects, ["AliceCapability", "PlaybackControlCapability"]);
+        prepare_playback(None, true).await.unwrap();
+    }
     #[test]
     fn native_volume_commands_are_distinct_from_music_and_questions() {
         for text in [

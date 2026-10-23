@@ -28,8 +28,8 @@ impl AudioGuard {
     pub fn healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire)
     }
-    pub async fn run(&self) {
-        self.run_with(crate::voice::pause_native).await;
+    pub async fn run(&self, address: std::net::SocketAddr) {
+        self.run_with(|| crate::voice::pause_native(address)).await;
     }
     async fn run_with<F, Fut>(&self, mut pause: F)
     where

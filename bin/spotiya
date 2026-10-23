@@ -44,7 +44,7 @@ def main():
     parser.add_argument("--device", default=configured_device(), help="ADB serial/IP; otherwise configured or only connected device")
     parser.add_argument("command", nargs="?", default="tui", choices=(
         "tui", "login", "status", "play", "pause", "resume", "toggle", "next",
-        "previous", "volume", "voice", "spectrum", "retry", "release", "start", "stop", "restart", "version"))
+        "previous", "volume", "voice", "spectrum", "retry", "release", "start", "stop", "restart", "version", "profile", "profiles"))
     parser.add_argument("value", nargs="*")
     args = parser.parse_args()
     if args.command == "play":
@@ -64,11 +64,12 @@ def main():
         os.execvp("adb", adb + ["shell", shlex.join(["/etc/init.d/S99spotify-connect", args.command])])
     if args.command == "tui" and not sys.stdin.isatty():
         parser.error("tui needs an interactive terminal")
-    if args.command not in ("status", "version"):
+    if args.command not in ("status", "version", "profile", "profiles"):
         start = subprocess.run(adb + ["shell", shlex.join([BASE + "/start.sh"])], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if start.returncode or not any(s in start.stdout for s in ("already running", "Connect started")):
             sys.exit(start.stdout.strip() or "Unable to start receiver")
-    remote = shlex.join([BASE + "/spotiya", "--" + args.command] + value)
+    remote_command = "profile-info" if args.command == "profile" else args.command
+    remote = shlex.join([BASE + "/spotiya", "--" + remote_command] + value)
     if args.command == "tui":
         columns, rows = shutil.get_terminal_size(fallback=(80, 24))
         remote = f"stty rows {rows} cols {columns}; exec " + remote

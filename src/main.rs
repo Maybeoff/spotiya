@@ -1,4 +1,4 @@
-use alsa::mixer::{SelemChannelId, SelemId};
+use alsa::mixer::SelemId;
 use futures_util::StreamExt;
 use librespot::{
     connect::{ConnectConfig, LoadRequest, LoadRequestOptions, Spirc},
@@ -38,6 +38,7 @@ mod device;
 mod ducking;
 mod logging;
 mod playback;
+mod profiles;
 mod recovery;
 mod spectrum;
 mod supervisor;
@@ -59,10 +60,6 @@ struct Shared {
     ducking: Arc<ducking::Ducking>,
 }
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
-
-unsafe extern "C" {
-    fn mini2_buttons_run() -> i32;
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mini2_receiver_running() -> i32 {
@@ -130,11 +127,12 @@ fn from_percent(value: u16) -> u16 {
     ((u32::from(value.min(100)) * 65535 + 50) / 100) as u16
 }
 
-struct MasterMixer {
+struct DeviceMixer {
     shared: Arc<Shared>,
     handle: Mutex<Option<alsa::mixer::Mixer>>,
+    audio: profiles::Audio,
 }
-impl MasterMixer {
+impl DeviceMixer {
     fn with_control<T>(
         &self,
         action: impl FnOnce(&alsa::mixer::Selem<'_>) -> Result<T, alsa::Error>,
@@ -142,32 +140,36 @@ impl MasterMixer {
         let mut handle = self
             .handle
             .lock()
-            .map_err(|_| alsa::Error::new("Master lock", libc::EIO))?;
+            .map_err(|_| alsa::Error::new("ALSA mixer lock", libc::EIO))?;
         if handle.is_none() {
-            *handle = Some(alsa::mixer::Mixer::new("default", true)?);
+            *handle = Some(alsa::mixer::Mixer::new(&self.audio.mixer_device, true)?);
         }
-        let result = Self::access(handle.as_ref().unwrap(), action);
+        let result = self.access(handle.as_ref().unwrap(), action);
         if result.is_err() {
             *handle = None;
         }
         result
     }
     fn access<T>(
+        &self,
         mixer: &alsa::mixer::Mixer,
         action: impl FnOnce(&alsa::mixer::Selem<'_>) -> Result<T, alsa::Error>,
     ) -> Result<T, alsa::Error> {
         mixer.handle_events()?;
         let control = mixer
-            .find_selem(&SelemId::new("Master", 0))
-            .ok_or_else(|| alsa::Error::new("Master mixer", libc::ENOENT))?;
+            .find_selem(&SelemId::new(
+                &self.audio.mixer_control,
+                self.audio.mixer_index,
+            ))
+            .ok_or_else(|| alsa::Error::new("ALSA mixer control", libc::ENOENT))?;
         action(&control)
     }
     fn read(&self) -> Result<u16, alsa::Error> {
         self.with_control(|control| {
             let (min, max) = control.get_playback_volume_range();
-            let value = control.get_playback_volume(SelemChannelId::FrontLeft)?;
+            let value = control.get_playback_volume(self.audio.mixer_channel.alsa())?;
             if max <= min {
-                return Err(alsa::Error::new("Master range", libc::EINVAL));
+                return Err(alsa::Error::new("ALSA mixer range", libc::EINVAL));
             }
             Ok(((value - min).clamp(0, max - min) * 65535 / (max - min)) as u16)
         })
@@ -176,7 +178,7 @@ impl MasterMixer {
         self.with_control(|control| {
             let (min, max) = control.get_playback_volume_range();
             if max <= min {
-                return Err(alsa::Error::new("Master range", libc::EINVAL));
+                return Err(alsa::Error::new("ALSA mixer range", libc::EINVAL));
             }
             let value = min + (i64::from(volume) * (max - min) + 32767) / 65535;
             control.set_playback_volume_all(value)?;
@@ -184,11 +186,17 @@ impl MasterMixer {
         })
     }
 }
-impl Mixer for MasterMixer {
-    fn open(_: MixerConfig) -> Result<Self, Error> {
+impl Mixer for DeviceMixer {
+    fn open(config: MixerConfig) -> Result<Self, Error> {
         Ok(Self {
             shared: SHARED.get().expect("receiver initialized").clone(),
             handle: Mutex::new(None),
+            audio: profiles::Audio {
+                mixer_device: config.device,
+                mixer_control: config.control,
+                mixer_index: config.index,
+                ..Default::default()
+            },
         })
     }
     fn volume(&self) -> u16 {
@@ -209,7 +217,7 @@ impl Mixer for MasterMixer {
         if let Ok(actual) = self.write(value) {
             self.shared.volume.store(actual, Ordering::Release);
         } else {
-            eprintln!("receiver: Master volume write failed");
+            eprintln!("receiver: mixer volume write failed");
         }
     }
 }
@@ -220,22 +228,31 @@ struct Options {
     buttons: bool,
     voice: bool,
     supervise: bool,
+    profile: String,
 }
 fn options() -> Result<Option<Options>, String> {
     let mut result = Options {
         state_dir: "/data/opt/spotify-connect/receiver-state".into(),
         name: device::system_name(),
-        buttons: device::mini2_controls_available(),
+        buttons: true,
         voice: true,
         supervise: false,
+        profile: "auto".into(),
     };
     let mut args = std::env::args().skip(1);
+    let mut profile_info = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--state-dir" => {
                 result.state_dir = args.next().ok_or("missing state directory")?.into()
             }
             "--name" => result.name = args.next().ok_or("missing device name")?,
+            "--profile" => result.profile = args.next().ok_or("missing profile id or JSON path")?,
+            "--profile-info" => profile_info = true,
+            "--profiles" => {
+                profiles::list();
+                return Ok(None);
+            }
             "--supervise" => result.supervise = true,
             "--no-buttons" => result.buttons = false,
             "--no-voice" => result.voice = false,
@@ -295,14 +312,31 @@ fn options() -> Result<Option<Options>, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "spotiya [--state-dir PATH] [--name NAME] [--no-buttons] [--no-voice]\nspotiya --tui | --login | --status | --version\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --release | --retry"
+                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info\nspotiya --tui | --login | --status | --version\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --release | --retry"
                 );
                 return Ok(None);
             }
             _ => return Err(format!("unknown option: {arg}")),
         }
     }
+    if profile_info {
+        let resolved = resolved_profile(&result).map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resolved).map_err(|e| e.to_string())?
+        );
+        return Ok(None);
+    }
     Ok(Some(result))
+}
+fn resolved_profile(options: &Options) -> io::Result<profiles::Resolved> {
+    let mut resolved = profiles::load(&options.profile, &options.state_dir)?;
+    if !options.buttons {
+        resolved.capabilities.buttons = false;
+        resolved.capabilities.ring = false;
+        resolved.capabilities.display = false;
+    }
+    Ok(resolved)
 }
 fn file_lock(dir: &Path, name: &str) -> io::Result<File> {
     fs::create_dir_all(dir)?;
@@ -402,18 +436,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     if options.supervise {
+        let _ = resolved_profile(&options)?;
         supervisor::run(&options).await?;
         return Ok(());
     }
     let _lock = file_lock(&options.state_dir, "receiver.lock")?;
     logging::init()?;
+    let resolved = resolved_profile(&options)?;
+    let profile = resolved.profile;
+    let caps = resolved.capabilities;
+    let native = profile.voice.as_ref().map(|v| v.address);
     let voice_setting = options.state_dir.join("voice-enabled");
     let mut voice_enabled = options.voice
+        && caps.voice
         && fs::read_to_string(&voice_setting)
             .map(|s| s.trim() != "0")
             .unwrap_or(true);
     let spectrum_setting = options.state_dir.join("spectrum-enabled");
-    let spectrum_supported = options.buttons && device::mini2_display_available();
+    let spectrum_supported = caps.display;
     let spectrum_enabled =
         spectrum_supported && fs::read_to_string(&spectrum_setting).is_ok_and(|s| s.trim() == "1");
     let last_track_file = options.state_dir.join("last-track");
@@ -451,11 +491,17 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         ducking: Arc::new(ducking::Ducking::new()),
     });
     let _ = SHARED.set(shared.clone());
-    let mixer = Arc::new(MasterMixer {
+    let mixer = Arc::new(DeviceMixer {
         shared: shared.clone(),
         handle: Mutex::new(None),
+        audio: profile.audio.clone(),
     });
-    let initial = mixer.read()?;
+    let initial = mixer.read().map_err(|e| {
+        io::Error::other(format!(
+            "Cannot open ALSA mixer '{}' on '{}': {e}; check the device profile",
+            profile.audio.mixer_control, profile.audio.mixer_device
+        ))
+    })?;
     shared.volume.store(initial, Ordering::Relaxed);
     let mut session = Session::new(config.clone(), Some(cache.clone()));
     let player_config = PlayerConfig {
@@ -466,13 +512,19 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let backend = audio_backend::find(Some("alsa".into())).expect("ALSA compiled");
     let visual = shared.spectrum.clone();
     let ducking = shared.ducking.clone();
+    let audio_device = profile.audio.device.clone();
+    let audio_format = profile
+        .audio
+        .format
+        .parse::<AudioFormat>()
+        .map_err(|_| io::Error::other("Invalid profile audio format"))?;
     let player = Player::new(
         player_config,
         session.clone(),
         mixer.get_soft_volume(),
         move || {
             Box::new(spectrum::VisualSink::new(
-                backend(Some("default".into()), AudioFormat::S16),
+                backend(Some(audio_device), audio_format),
                 visual.clone(),
                 ducking.clone(),
             ))
@@ -480,11 +532,17 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut events = player.get_player_event_channel();
     let (voice_tx, mut voice_rx) = mpsc::channel(8);
-    let voice_watch = tokio::spawn(voice::watch(voice_tx.clone(), shared.ducking.clone()));
+    let voice_watch = native.map(|address| {
+        tokio::spawn(voice::watch(
+            voice_tx.clone(),
+            shared.ducking.clone(),
+            address,
+        ))
+    });
     let (login_tx, mut login_rx) = mpsc::channel::<auth::Login>(1);
     let control_config = config.clone();
     let voice_control = tokio::spawn(async move {
-        if control::serve(voice_tx, login_tx, control_config, spectrum_supported)
+        if control::serve(voice_tx, login_tx, control_config, caps)
             .await
             .is_err()
         {
@@ -492,18 +550,22 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let audio_guard = Arc::new(audio_guard::AudioGuard::new());
-    let audio_worker = {
+    let audio_worker = native.map(|address| {
         let guard = audio_guard.clone();
         tokio::spawn(async move {
-            guard.run().await;
+            guard.run(address).await;
         })
-    };
-    let controls = if options.buttons {
+    });
+    let controls = if caps.controls() {
+        let config = profile
+            .controls
+            .clone()
+            .expect("controls capability requires a driver");
         Some(
             std::thread::Builder::new()
                 .name("spotiya-controls".into())
                 .stack_size(128 * 1024)
-                .spawn(|| unsafe { mini2_buttons_run() })?,
+                .spawn(move || config.run(caps))?,
         )
     } else {
         None
@@ -522,6 +584,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let mut info = control::Status {
         name: options.name.clone(),
         voice: voice_enabled,
+        voice_supported: caps.voice,
+        profile: profile.id.clone(),
         spectrum_supported,
         ..Default::default()
     };
@@ -529,7 +593,10 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let mut failures = recovery::Failures::default();
     let mut retry_track = None::<String>;
     let mut reclaim_at = Instant::now() + Duration::from_secs(30);
-    eprintln!("receiver: ready, integrated buttons/ring/display; one Master volume");
+    eprintln!(
+        "receiver: ready, profile={}, buttons={}, ring={}, display={}, voice={}",
+        profile.id, caps.buttons, caps.ring, caps.display, caps.voice
+    );
     loop {
         tokio::select! {
             _=terminate.recv()=>break,
@@ -647,6 +714,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     },
                     voice::Intent::Voice(enabled)=>{
+                        if !caps.voice {continue;}
                         if fs::write(&voice_setting,if enabled{"1\n"}else{"0\n"}).is_ok(){voice_enabled=enabled;info.voice=enabled;}
                         else{eprintln!("voice: could not save voice setting");}
                         continue;
@@ -679,22 +747,19 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 let Some(handle)=spirc.as_ref() else {eprintln!("voice: Spotify is not connected yet");continue;};
                 match intent {
                     voice::Intent::Play(query)=>{
-                        if event.from_voice && voice::cancel_alice().await.is_err() {eprintln!("voice: could not cancel native conversation");continue;}
-                        let _=voice::pause_native().await;
+                        if voice::prepare_playback(native,event.from_voice).await.is_err() {eprintln!("voice: could not cancel native conversation");continue;}
                         let _=handle.activate();
                         let request=LoadRequest::from_context_uri(voice::context(&query),LoadRequestOptions{start_playing:true,..Default::default()});
                         if handle.load(request).is_ok() {eprintln!("voice: Spotify music query queued");}
                     },
                     voice::Intent::Resume if !shared.active.load(Ordering::Acquire) && last_track.is_some()=>{
-                        if event.from_voice && voice::cancel_alice().await.is_err() {continue;}
-                        let _=voice::pause_native().await;
+                        if voice::prepare_playback(native,event.from_voice).await.is_err() {continue;}
                         let _=handle.activate();
                         let request=LoadRequest::from_tracks(vec![last_track.clone().unwrap()],LoadRequestOptions{start_playing:true,..Default::default()});
                         if handle.load(request).is_ok() {eprintln!("voice: last Spotify track queued");}
                     },
                     intent if shared.active.load(Ordering::Acquire)=>{
-                        if event.from_voice {let _=voice::cancel_alice().await;}
-                        let _=voice::pause_native().await;
+                        let _=voice::prepare_playback(native,event.from_voice).await;
                         match intent {
                             voice::Intent::Pause=>{let _=handle.pause();},
                             voice::Intent::Resume=>{let _=handle.play();},
@@ -747,9 +812,13 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
     shared.active.store(false, Ordering::Release);
     shared.running.store(false, Ordering::Release);
-    voice_watch.abort();
+    if let Some(worker) = voice_watch {
+        worker.abort();
+    }
     audio_guard.set_playing(false);
-    audio_worker.abort();
+    if let Some(worker) = audio_worker {
+        worker.abort();
+    }
     voice_control.abort();
     let _ = fs::remove_file(voice::CONTROL);
     stop_connection(&mut spirc, &mut task, &session, &shared, &mut playback).await;

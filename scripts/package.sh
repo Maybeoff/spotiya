@@ -8,6 +8,8 @@ mkdir -p dist
 stage=$(mktemp -d "$SPOTIYA_ROOT/dist/package.XXXXXX")
 trap 'rm -rf "$stage"' EXIT HUP INT TERM
 mkdir -p "$stage/spotiya/packaging" "$stage/spotiya/scripts" "$stage/spotiya/bin"
+mkdir -p "$stage/spotiya/profiles"
+cp profiles/*.json "$stage/spotiya/profiles/"
 cp "$binary" "$stage/spotiya/spotiya"
 cp README.md LICENSE "$stage/spotiya/"
 cp packaging/* "$stage/spotiya/packaging/"

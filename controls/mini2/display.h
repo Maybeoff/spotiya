@@ -1,4 +1,7 @@
 /* Shared display overlays yield to native animations and preserve the clock. */
+#ifndef DISPLAY_PREFIX
+#define DISPLAY_PREFIX control_config.display_prefix
+#endif
 enum { DISPLAY_LEDS = 34 };
 enum { DISPLAY_VOLUME = 1, DISPLAY_SPECTRUM = 2 };
 struct display {
@@ -19,16 +22,16 @@ static void display_close(struct display *d) {
     d->mode = 0;
 }
 static int display_open(struct display *d) {
+    if (!DISPLAY_PREFIX)
+        return 0;
     static const char *extra[] = {"PLUS1", "PLUS2", "PLUS3", "PLUS4", "MINUS", "DEGREE"};
     int count = 0, brightness = 0;
     for (int i = 0; i < DISPLAY_LEDS; i++) {
         char path[128];
-        size_t n = strlen(LED_ROOT);
+        size_t n = strlen(DISPLAY_PREFIX);
         if (n + 40 > sizeof path)
             goto fail;
-        memcpy(path, LED_ROOT, n);
-        memcpy(path + n, "mini2:white:clock", 17);
-        n += 17;
+        memcpy(path, DISPLAY_PREFIX, n);
         if (i < 28) {
             path[n++] = (char)('A' + i % 7);
             path[n++] = (char)('1' + i / 7);

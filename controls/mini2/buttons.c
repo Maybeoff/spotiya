@@ -2,8 +2,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include "config.h"
 
-enum { VOL_DOWN = 114, VOL_UP = 115, ALICE = 582 };
 enum action { TOGGLE, NEXT, PREV, LOUDER, QUIETER };
 enum { GESTURE_US = 250000, REPEAT_DELAY_US = 450000, REPEAT_US = 180000 };
 struct key {
@@ -23,7 +23,10 @@ static void emit(enum action a) {
         queue[queued++] = a;
 }
 static int key_index(unsigned code) {
-    return code == VOL_DOWN ? 0 : code == VOL_UP ? 1 : code == ALICE ? 2 : -1;
+    return code == control_config.volume_down ? 0
+           : code == control_config.volume_up ? 1
+           : code == control_config.alice     ? 2
+                                              : -1;
 }
 static void tick(struct gesture *g, int64_t now) {
     if (g->pending && now >= g->pending) {
@@ -131,9 +134,12 @@ static int empty_keys(const unsigned char *keys) {
             return 0;
     return 1;
 }
-int mini2_buttons_run(void) {
-    int fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
-    if (fd < 0) {
+int mini2_buttons_run(const struct mini2_config *config) {
+    if (!config)
+        return 1;
+    control_config = *config;
+    int fd = control_config.input ? open(control_config.input, O_RDONLY | O_NONBLOCK) : -1;
+    if (control_config.input && fd < 0) {
         note("buttons: input open failed\n");
         return 1;
     }
@@ -144,7 +150,8 @@ int mini2_buttons_run(void) {
     int grabbed = 0, wanted = 0;
     int64_t probe_at = 0;
     struct input_event_abi events[64];
-    note("buttons: ready (Alice control until Spotify is active)\n");
+    note(fd >= 0 ? "buttons: ready (Alice control until Spotify is active)\n"
+                 : "controls: visual feedback ready\n");
     while (running) {
         if (!mini2_receiver_running())
             break;
@@ -162,8 +169,8 @@ int mini2_buttons_run(void) {
                 display_close(&display);
             }
         }
-        ssize_t n;
-        while ((n = read(fd, events, sizeof events)) > 0) {
+        ssize_t n = 0;
+        while (fd >= 0 && (n = read(fd, events, sizeof events)) > 0) {
             if (n % (ssize_t)sizeof events[0]) {
                 note("buttons: input ABI mismatch\n");
                 running = 0;
@@ -192,11 +199,11 @@ int mini2_buttons_run(void) {
                 }
             }
         }
-        if (n < 0 && errno != EAGAIN && errno != EINTR) {
+        if (fd >= 0 && n < 0 && errno != EAGAIN && errno != EINTR) {
             note("buttons: input read failed\n");
             break;
         }
-        if (wanted != grabbed && empty_keys(held)) {
+        if (fd >= 0 && wanted != grabbed && empty_keys(held)) {
             /* EVIOCGKEY returns the bitmap length on success, not zero. */
             int released = !wanted || (ioctl(fd, EVIOCGKEY96, actual) >= 0 && empty_keys(actual));
             if (released) {
@@ -259,7 +266,8 @@ int mini2_buttons_run(void) {
         ioctl(fd, EVIOCGRAB, 0);
     lights_close(&lights, 1);
     display_close(&display);
-    close(fd);
+    if (fd >= 0)
+        close(fd);
     return 0;
 }
 #endif

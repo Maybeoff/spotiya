@@ -1,6 +1,6 @@
 /* Short, cooperative ring effects. Never claim a ring already used by Alice. */
-#ifndef LED_ROOT
-#define LED_ROOT "/sys/class/leds/"
+#ifndef RING_PREFIX
+#define RING_PREFIX control_config.ring_prefix
 #endif
 struct lights {
     int fd[18], active, scene, paused, volume, steps;
@@ -51,18 +51,18 @@ static void lights_close(struct lights *l, int restore) {
     l->active = 0;
 }
 static int lights_open(struct lights *l) {
+    if (!RING_PREFIX)
+        return 0;
     static const char *colors[] = {"red:ring1/brightness", "green:ring1/brightness",
                                    "blue:ring1/brightness"};
     int count = 0;
     for (int color = 0; color < 3; color++)
         for (int segment = 0; segment < 6; segment++) {
             char path[128];
-            size_t n = strlen(LED_ROOT);
-            if (n + strlen("mini2:") + strlen(colors[color]) + 1 > sizeof path)
+            size_t n = strlen(RING_PREFIX);
+            if (n + strlen(colors[color]) + 1 > sizeof path)
                 goto fail;
-            memcpy(path, LED_ROOT, n);
-            memcpy(path + n, "mini2:", 6);
-            n += 6;
+            memcpy(path, RING_PREFIX, n);
             strcpy(path + n, colors[color]);
             char *digit = strstr(path + n, "ring1");
             digit[4] = (char)('1' + segment);

@@ -134,6 +134,8 @@ pub async fn run(options: &Options) -> io::Result<()> {
         options.state_dir.clone().into_os_string(),
         OsString::from("--name"),
         OsString::from(&options.name),
+        OsString::from("--profile"),
+        OsString::from(&options.profile),
     ];
     if !options.buttons {
         args.push("--no-buttons".into());
