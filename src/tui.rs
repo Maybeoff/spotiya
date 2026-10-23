@@ -70,7 +70,9 @@ fn clock(ms: u32) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> Vec<String> {
-    let state = if !status.connected {
+    let state = if status.retry_required {
+        "RETRY REQUIRED"
+    } else if !status.connected {
         "CONNECTING"
     } else if !status.error.is_empty() {
         "UNAVAILABLE"
@@ -135,11 +137,18 @@ fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> 
         String::new(),
         "Space pause/play   n next   p previous   +/- volume".into(),
         "/ search   l login   v voice   e spectrum on/off".into(),
-        "x release to Alice   q quit".into(),
+        "r retry   x release to Alice   q quit".into(),
         String::new(),
     ];
     if !status.error.is_empty() {
         out.push(safe(&status.error));
+        if status.retry_required {
+            out.push(if status.retry_after_secs > 0 {
+                format!("Retry available in {}s", status.retry_after_secs)
+            } else {
+                "Press r to retry".into()
+            });
+        }
     }
     out.extend(notice.lines().map(safe));
     if let Some(input) = prompt {
@@ -264,6 +273,15 @@ pub fn run() -> io::Result<()> {
                         None
                     }
                 }
+                b'r' => {
+                    if status.retry_required && status.retry_after_secs == 0 {
+                        Some("RETRY".into())
+                    } else {
+                        notice =
+                            format!("Retry unavailable; cooldown {}s", status.retry_after_secs);
+                        None
+                    }
+                }
                 b'x' => Some("RELEASE".to_owned()),
                 b'/' => {
                     prompt = Some(Vec::new());
@@ -335,6 +353,19 @@ mod tests {
         let frame = lines(&status, "", None, 80);
         assert!(frame.iter().any(|s| s.ends_with("|   UNAVAILABLE")));
         assert!(frame.iter().any(|s| s == "Track unavailable"));
+    }
+    #[test]
+    fn latched_failure_is_visible_while_spotify_is_disconnected() {
+        let status = Status {
+            retry_required: true,
+            retry_after_secs: 12,
+            error: "Audio key request failed".into(),
+            ..Default::default()
+        };
+        let frame = lines(&status, "", None, 90);
+        assert!(frame.iter().any(|s| s.ends_with("|   RETRY REQUIRED")));
+        assert!(frame.iter().any(|s| s == "Retry available in 12s"));
+        assert!(frame.iter().any(|s| s == "Audio key request failed"));
     }
     #[test]
     fn spectrum_state_is_visible_for_supported_and_other_devices() {

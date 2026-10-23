@@ -22,6 +22,7 @@ pub enum Intent {
     Voice(bool),
     Spectrum(bool),
     Release,
+    Retry,
 }
 pub struct Event {
     pub intent: Intent,

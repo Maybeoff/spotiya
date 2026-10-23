@@ -37,7 +37,9 @@ mod control;
 mod device;
 mod logging;
 mod playback;
+mod recovery;
 mod spectrum;
+mod supervisor;
 mod tui;
 mod voice;
 
@@ -179,6 +181,7 @@ struct Options {
     name: String,
     buttons: bool,
     voice: bool,
+    supervise: bool,
 }
 fn options() -> Result<Option<Options>, String> {
     let mut result = Options {
@@ -186,6 +189,7 @@ fn options() -> Result<Option<Options>, String> {
         name: device::system_name(),
         buttons: device::mini2_controls_available(),
         voice: true,
+        supervise: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -194,6 +198,7 @@ fn options() -> Result<Option<Options>, String> {
                 result.state_dir = args.next().ok_or("missing state directory")?.into()
             }
             "--name" => result.name = args.next().ok_or("missing device name")?,
+            "--supervise" => result.supervise = true,
             "--no-buttons" => result.buttons = false,
             "--no-voice" => result.voice = false,
             "--tui" => {
@@ -216,7 +221,7 @@ fn options() -> Result<Option<Options>, String> {
                 return Err("Pairing connection closed before login completed".into());
             }
             "--play" | "--resume" | "--pause" | "--next" | "--previous" | "--toggle"
-            | "--volume" | "--voice" | "--spectrum" | "--release" => {
+            | "--volume" | "--voice" | "--spectrum" | "--release" | "--retry" => {
                 let command = match arg.as_str() {
                     "--play" => format!("PLAY {}", args.next().ok_or("missing music query")?),
                     "--resume" => "RESUME".to_owned(),
@@ -225,6 +230,7 @@ fn options() -> Result<Option<Options>, String> {
                     "--previous" => "PREVIOUS".to_owned(),
                     "--toggle" => "TOGGLE".to_owned(),
                     "--release" => "RELEASE".to_owned(),
+                    "--retry" => "RETRY".to_owned(),
                     "--volume" => format!("VOLUME {}", args.next().ok_or("missing volume 0..100")?),
                     _ => format!(
                         "{} {}",
@@ -251,7 +257,7 @@ fn options() -> Result<Option<Options>, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "spotiya [--state-dir PATH] [--name NAME] [--no-buttons] [--no-voice]\nspotiya --tui | --login | --status | --version\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --release"
+                    "spotiya [--state-dir PATH] [--name NAME] [--no-buttons] [--no-voice]\nspotiya --tui | --login | --status | --version\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --release | --retry"
                 );
                 return Ok(None);
             }
@@ -260,14 +266,14 @@ fn options() -> Result<Option<Options>, String> {
     }
     Ok(Some(result))
 }
-fn instance_lock(dir: &Path) -> io::Result<File> {
+fn file_lock(dir: &Path, name: &str) -> io::Result<File> {
     fs::create_dir_all(dir)?;
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(dir.join("receiver.lock"))?;
+        .open(dir.join(name))?;
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -276,13 +282,21 @@ fn instance_lock(dir: &Path) -> io::Result<File> {
 fn publish_status(
     s: &Shared,
     playback: &playback::Playback,
+    failures: &recovery::Failures,
     info: &mut control::Status,
     last: &mut String,
 ) {
     s.paused.store(playback.paused(), Ordering::Relaxed);
     s.active.store(playback.active(), Ordering::Release);
     info.loading = playback.loading();
-    info.error = playback.error().to_owned();
+    info.retry_required = failures.blocked();
+    info.retry_after_secs = failures.retry_after();
+    info.failed_tracks = failures.count();
+    info.error = if failures.blocked() {
+        failures.message()
+    } else {
+        playback.error().to_owned()
+    };
     info.position_ms = playback.position_ms().min(info.duration_ms);
     info.active = s.active.load(Ordering::Acquire);
     info.paused = s.paused.load(Ordering::Relaxed);
@@ -330,7 +344,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(options) = options().map_err(io::Error::other)? else {
         return Ok(());
     };
-    let _lock = instance_lock(&options.state_dir)?;
+    if options.supervise {
+        supervisor::run(&options).await?;
+        return Ok(());
+    }
+    let _lock = file_lock(&options.state_dir, "receiver.lock")?;
     logging::init()?;
     let voice_setting = options.state_dir.join("voice-enabled");
     let mut voice_enabled = options.voice
@@ -446,6 +464,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     let mut playback = playback::Playback::default();
+    let mut failures = recovery::Failures::default();
+    let mut retry_track = None::<String>;
     eprintln!("receiver: ready, integrated buttons/ring/display; one Master volume");
     loop {
         tokio::select! {
@@ -460,10 +480,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(login)=login_rx.recv()=>{
                 audio_guard.set_playing(false);
                 stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
+                failures.reset();retry_track=None;
                 credentials=Some(login.credentials);pending_login=Some(login.completed);
                 retry_at=Instant::now();backoff=5;
             },
-            _=tokio::time::sleep_until(retry_at), if spirc.is_none() && credentials.is_some()=>{
+            _=tokio::time::sleep_until(retry_at), if spirc.is_none() && credentials.is_some() && !failures.blocked()=>{
                 session=Session::new(config.clone(),Some(cache.clone()));
                 player.set_session(session.clone());
                 let connect=ConnectConfig { name:options.name.clone(), initial_volume:mixer.volume(),
@@ -478,6 +499,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(Ok((handle,future)))=>{
                         spirc=Some(handle);task=Some(tokio::spawn(future));backoff=5;eprintln!("receiver: Spotify connected");
                         if let Some(reply)=pending_login.take(){let _=reply.send(Ok(()));}
+                        if let Some(uri)=retry_track.take() && let Some(handle)=spirc.as_ref() {
+                            let _=handle.activate();
+                            let request=LoadRequest::from_tracks(vec![uri],LoadRequestOptions{start_playing:true,..Default::default()});
+                            let _=handle.load(request);
+                        }
                     },
                     Ok(Err(e))=>{
                         if let Some(reply)=pending_login.take(){let _=reply.send(Err("Receiver could not connect the new account"));}
@@ -496,7 +522,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 retry_at=Instant::now()+Duration::from_secs(5);eprintln!("receiver: reconnect scheduled");
             },
             Some(event)=events.recv()=>{
-                if !playback.update(&event) {continue;}
+                if failures.blocked() || !playback.update(&event) {continue;}
+                if failures.observe(&event) {
+                    log::warn!("receiver: {}",failures.message());
+                    audio_guard.set_playing(false);player.stop();
+                    stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
+                    while events.try_recv().is_ok() {}
+                }
                 match event {
                     PlayerEvent::PlayRequestIdChanged{..}=>{
                         info.title.clear();info.artist.clear();info.album.clear();info.duration_ms=0;
@@ -543,6 +575,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if event.received.elapsed()>Duration::from_secs(5) {continue;}
                 if event.from_voice && !voice_enabled {continue;}
                 let intent=match event.intent {
+                    voice::Intent::Retry=>{
+                        if let Some(uri)=failures.retry() {
+                            retry_track=Some(uri);retry_at=Instant::now();backoff=5;
+                            eprintln!("receiver: explicit retry scheduled");
+                        } else {eprintln!("receiver: retry unavailable or cooling down");}
+                        publish_status(&shared,&playback,&failures,&mut info,&mut last_status);
+                        continue;
+                    },
                     voice::Intent::Voice(enabled)=>{
                         if fs::write(&voice_setting,if enabled{"1\n"}else{"0\n"}).is_ok(){voice_enabled=enabled;info.voice=enabled;}
                         else{eprintln!("voice: could not save voice setting");}
@@ -572,6 +612,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     voice::Intent::Toggle=>if shared.active.load(Ordering::Acquire)&&!shared.paused.load(Ordering::Relaxed){voice::Intent::Pause}else{voice::Intent::Resume},
                     intent=>intent,
                 };
+                if failures.blocked() {continue;}
                 let Some(handle)=spirc.as_ref() else {eprintln!("voice: Spotify is not connected yet");continue;};
                 match intent {
                     voice::Intent::Play(query)=>{
@@ -616,7 +657,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audio_guard.set_playing(playing);
         info.connected = spirc.is_some();
         info.native_guard = playing && audio_guard.healthy();
-        publish_status(&shared, &playback, &mut info, &mut last_status);
+        publish_status(&shared, &playback, &failures, &mut info, &mut last_status);
     }
     shared.active.store(false, Ordering::Release);
     shared.running.store(false, Ordering::Release);
@@ -633,7 +674,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tokio::time::timeout(Duration::from_secs(2), discovery.shutdown()).await;
     info.connected = false;
     info.native_guard = false;
-    publish_status(&shared, &playback, &mut info, &mut last_status);
+    publish_status(&shared, &playback, &failures, &mut info, &mut last_status);
     eprintln!("receiver: stopped");
     Ok(())
 }

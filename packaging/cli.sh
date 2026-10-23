@@ -10,14 +10,14 @@ case "${1:-tui}" in
         [ "$#" -gt 0 ] || { echo 'Usage: spotiya play SONG_OR_ARTIST' >&2; exit 1; }
         set -- --play "$*"
         ;;
-    tui|login|status|pause|resume|toggle|next|previous|volume|voice|spectrum|release|version|help)
+    tui|login|status|pause|resume|toggle|next|previous|volume|voice|spectrum|retry|release|version|help)
         SPOTIYA_COMMAND=${1:-tui}
         [ "$#" -eq 0 ] || shift
         set -- "--$SPOTIYA_COMMAND" "$@"
         ;;
 esac
 case "${1:-}" in
-    --tui|--login|--play|--pause|--resume|--toggle|--next|--previous|--volume|--voice|--spectrum|--release)
+    --tui|--login|--play|--pause|--resume|--toggle|--next|--previous|--volume|--voice|--spectrum|--retry|--release)
         "$SPOTIYA_BASE/start.sh" >/dev/null
         ;;
 esac

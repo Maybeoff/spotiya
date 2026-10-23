@@ -3,6 +3,17 @@ use std::env;
 fn builder(filter: Option<&str>) -> env_logger::Builder {
     let mut builder = env_logger::Builder::new();
     builder.parse_filters(filter.unwrap_or("warn"));
+    builder.format(|buffer, record| {
+        use std::io::Write;
+        crate::recovery::note(record);
+        writeln!(
+            buffer,
+            "[{} {}] {}",
+            record.level(),
+            record.target(),
+            record.args()
+        )
+    });
     builder
 }
 pub fn init() -> Result<(), log::SetLoggerError> {

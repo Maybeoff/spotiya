@@ -25,6 +25,9 @@ pub struct Status {
     pub paused: bool,
     pub loading: bool,
     pub error: String,
+    pub retry_required: bool,
+    pub retry_after_secs: u32,
+    pub failed_tracks: u8,
     pub volume: u16,
     pub connected: bool,
     pub voice: bool,
@@ -49,6 +52,7 @@ pub fn parse(line: &str) -> Option<Intent> {
         "VOICE OFF" => Some(Intent::Voice(false)),
         "SPECTRUM ON" => Some(Intent::Spectrum(true)),
         "SPECTRUM OFF" => Some(Intent::Spectrum(false)),
+        "RETRY" => Some(Intent::Retry),
         "RELEASE" => Some(Intent::Release),
         s => {
             if let Some(n) = s.strip_prefix("VOLUME ") {
@@ -104,7 +108,29 @@ pub async fn serve(
             let reply = if line.trim() == "STATUS" {
                 fs::read_to_string(STATUS).unwrap_or_else(|_| "ERROR Status unavailable\n".into())
             } else if let Some(intent) = parse(&line) {
-                if matches!(intent, Intent::Spectrum(_)) && !spectrum_supported {
+                let status = fs::read_to_string(STATUS)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Status>(&s).ok())
+                    .unwrap_or_default();
+                if matches!(intent, Intent::Retry)
+                    && (!status.retry_required || status.retry_after_secs > 0)
+                {
+                    format!(
+                        "ERROR Retry is unavailable; wait {} seconds or check status\n",
+                        status.retry_after_secs
+                    )
+                } else if status.retry_required
+                    && matches!(
+                        intent,
+                        Intent::Play(_)
+                            | Intent::Resume
+                            | Intent::Toggle
+                            | Intent::Next
+                            | Intent::Previous
+                    )
+                {
+                    "ERROR Playback stopped after repeated failures; use retry\n".into()
+                } else if matches!(intent, Intent::Spectrum(_)) && !spectrum_supported {
                     "ERROR Spectrum display is unavailable on this device\n".into()
                 } else if sender
                     .try_send(Event {
@@ -180,5 +206,7 @@ mod tests {
         assert_eq!(parse("SPECTRUM ON"), Some(Intent::Spectrum(true)));
         assert_eq!(parse("SPECTRUM OFF"), Some(Intent::Spectrum(false)));
         assert_eq!(parse("SPECTRUM 1"), None);
+        assert_eq!(parse("RETRY"), Some(Intent::Retry));
+        assert_eq!(parse("RETRY extra"), None);
     }
 }

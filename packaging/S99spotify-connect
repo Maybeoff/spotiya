@@ -1,35 +1,15 @@
 #!/bin/sh
 set -eu
-umask 077
 SPOTIFY_DIR=/data/opt/spotify-connect
 case "${1:-}" in
     start)
-        [ -x "$SPOTIFY_DIR/boot.sh" ] || exit 0
-        SPOTIFY_EXE=$(readlink -f "$SPOTIFY_DIR/spotiya")
-        rm -f /run/spotify-connect-stop
-        if [ -f /run/spotify-connect.pid ]; then
-            SPOTIFY_PID=$(cat /run/spotify-connect.pid)
-            case "$SPOTIFY_PID" in
-                ''|*[!0-9]*) ;;
-                *)
-                    if [ "$(readlink "/proc/$SPOTIFY_PID/exe" 2>/dev/null || true)" = "$SPOTIFY_EXE" ]; then
-                        echo "Spotify Connect already running"
-                        exit 0
-                    fi
-                    ;;
-            esac
-        fi
-        nohup setsid "$SPOTIFY_DIR/boot.sh" </dev/null >/tmp/spotify-connect-boot.log 2>&1 &
-        sleep 1
-        echo "Spotify Connect startup scheduled"
+        [ ! -x "$SPOTIFY_DIR/start.sh" ] || "$SPOTIFY_DIR/start.sh"
         ;;
     stop)
-        touch /run/spotify-connect-stop
         [ ! -x "$SPOTIFY_DIR/stop.sh" ] || "$SPOTIFY_DIR/stop.sh"
         ;;
     restart)
         "$0" stop
-        sleep 2
         "$0" start
         ;;
     *)
