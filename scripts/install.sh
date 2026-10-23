@@ -9,7 +9,7 @@ SPOTIYA_BINARY=${1:-"$SPOTIYA_ROOT/spotiya"}
 for file in run.sh start.sh stop.sh boot.sh service.sh cli.sh S99spotify-connect; do
     [ -f "$SPOTIYA_ROOT/packaging/$file" ] || { echo "Missing packaging/$file" >&2; exit 1; }
 done
-if [ -e /usr/bin/spotiya ] && [ "$(readlink -f /usr/bin/spotiya)" != "$SPOTIYA_BASE/cli.sh" ]; then
+if [ -e /usr/bin/spotiya ] && [ "$(readlink -f /usr/bin/spotiya)" != "$(readlink -f "$SPOTIYA_BASE/cli.sh")" ]; then
     echo '/usr/bin/spotiya belongs to another installation' >&2
     exit 1
 fi
