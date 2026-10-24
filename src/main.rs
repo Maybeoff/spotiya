@@ -317,7 +317,7 @@ fn options() -> Result<Option<Options>, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --login | --status | --version\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --release | --retry"
+                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --login | --status | --version\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --release | --retry"
                 );
                 return Ok(None);
             }
@@ -431,7 +431,11 @@ async fn stop_connection(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    unsafe extern "C" {
+        fn spotiya_native_stderr();
+    }
     unsafe {
+        spotiya_native_stderr();
         libc::umask(0o077);
         libc::mallopt(libc::M_ARENA_MAX, 1);
         // Player creates its own multi-thread runtime after this single-threaded entry point.

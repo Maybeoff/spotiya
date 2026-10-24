@@ -61,7 +61,10 @@ pub fn read(state: &Path) -> io::Result<Option<Saved>> {
     }
     if let Some(p) = saved.profile.take() {
         saved.profile = Some(profiles::parse(&serde_json::to_string(&p)?)?);
-    } else if !matches!(saved.selection.as_str(), "auto" | "mini2" | "generic") {
+    } else if !matches!(
+        saved.selection.as_str(),
+        "auto" | "mini1" | "mini2" | "generic"
+    ) {
         return Err(invalid("Unknown saved profile"));
     }
     Ok(Some(saved))
@@ -73,6 +76,11 @@ pub fn choices(state: &Path) -> io::Result<Vec<Choice>> {
             "auto",
             "Automatic",
             "Saved profile.json or hardware detection",
+        ),
+        (
+            "mini1",
+            "Yandex Station Mini (YNDX-0004)",
+            "Mini 1 audio and Quasar IPC",
         ),
         (
             "mini2",
@@ -101,7 +109,7 @@ pub fn choices(state: &Path) -> io::Result<Vec<Choice>> {
                 if path.extension().is_none_or(|s| s != "json")
                     || matches!(
                         path.file_name().and_then(|s| s.to_str()),
-                        Some("mini2.json" | "generic.json")
+                        Some("mini1.json" | "mini2.json" | "generic.json")
                     )
                 {
                     continue;
@@ -144,7 +152,12 @@ pub fn choices(state: &Path) -> io::Result<Vec<Choice>> {
     Ok(out)
 }
 pub fn resolve(state: &Path, selection: &str) -> io::Result<Saved> {
-    if matches!(selection, "auto" | "mini2" | "generic") {
+    let selection = if selection == "yandexmini" {
+        "mini1"
+    } else {
+        selection
+    };
+    if matches!(selection, "auto" | "mini1" | "mini2" | "generic") {
         return Ok(Saved {
             version: 1,
             selection: selection.into(),
@@ -303,6 +316,33 @@ mod tests {
         let p = std::env::temp_dir().join(format!("spotiya-selection-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&p).unwrap();
         p
+    }
+    #[test]
+    fn mini1_alias_is_saved_canonically_and_packaged_profile_is_not_duplicated() {
+        let root = fixture();
+        let state = root.join("state");
+        fs::create_dir(&state).unwrap();
+        let directory = root.join("profiles");
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("mini1.json"),
+            include_str!("../profiles/mini1.json"),
+        )
+        .unwrap();
+        let saved = resolve(&state, "yandexmini").unwrap();
+        assert_eq!(saved.selection, "mini1");
+        transaction(&state, &saved, |_| Ok(())).unwrap();
+        assert_eq!(read(&state).unwrap().unwrap().selection, "mini1");
+        assert_eq!(profiles::load(None, &state).unwrap().profile.id, "mini1");
+        assert_eq!(
+            choices(&state)
+                .unwrap()
+                .iter()
+                .filter(|c| c.id() == "mini1")
+                .count(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn selection_persists_and_custom_profiles_are_imported_as_snapshots() {

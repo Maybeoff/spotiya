@@ -7,6 +7,7 @@ use std::{
     path::{Component, Path},
 };
 
+const MINI1: &str = include_str!("../profiles/mini1.json");
 const MINI2: &str = include_str!("../profiles/mini2.json");
 const GENERIC: &str = include_str!("../profiles/generic.json");
 
@@ -205,6 +206,19 @@ fn rooted(root: &Path, path: &str) -> std::path::PathBuf {
     root.join(path.trim_start_matches('/'))
 }
 fn detect(root: &Path) -> &'static str {
+    // Mini 1's device tree identifies only the Amlogic SoC.
+    if let Ok(file) = fs::File::open(rooted(root, "/system/vendor/quasar/quasar.cfg"))
+        && let Ok(config) = serde_json::from_reader::<_, serde_json::Value>(file.take(256 * 1024))
+    {
+        match config
+            .pointer("/common/deviceType")
+            .and_then(|v| v.as_str())
+        {
+            Some("yandexmini") => return "mini1",
+            Some("yandexmini_2") => return "mini2",
+            _ => {}
+        }
+    }
     let compatible = fs::read(rooted(root, "/proc/device-tree/compatible")).unwrap_or_default();
     let model = fs::read(rooted(root, "/proc/device-tree/model")).unwrap_or_default();
     if compatible
@@ -312,6 +326,7 @@ fn load_at(selection: &str, state_dir: &Path, root: &Path) -> io::Result<Resolve
         selection
     };
     let profile = match selection {
+        "mini1" => parse(MINI1)?,
         "mini2" => parse(MINI2)?,
         "generic" => parse(GENERIC)?,
         path => read_file(Path::new(path))?,
@@ -401,6 +416,43 @@ mod tests {
         let r = f.load("auto").unwrap();
         assert_eq!(r.profile.id, "generic");
         assert!(!r.capabilities.controls() && !r.capabilities.voice);
+    }
+    #[test]
+    fn mini1_uses_quasar_model_on_generic_device_tree_without_mini2_controls() {
+        let f = Fixture::new();
+        f.file("/proc/device-tree/compatible", b"amlogic, axg\0");
+        f.file("/proc/device-tree/model", b"Amlogic\0");
+        f.file(
+            "/system/vendor/quasar/quasar.cfg",
+            br#"{"common":{"deviceType":"yandexmini"}}"#,
+        );
+        f.file("/dev/input/event2", b"");
+        f.file("/sys/class/input/event2/device/name", b"adc_keypad\n");
+        let r = f.load("auto").unwrap();
+        assert_eq!(r.profile.id, "mini1");
+        assert_eq!(r.profile.audio.device, "default");
+        assert_eq!(r.profile.audio.mixer_control, "Master");
+        assert_eq!(
+            r.profile.voice.unwrap().address,
+            "127.0.0.1:9875".parse().unwrap()
+        );
+        assert!(r.capabilities.voice);
+        assert!(!r.capabilities.controls());
+    }
+    #[test]
+    fn lite_and_invalid_model_metadata_do_not_enable_mini1_ipc() {
+        let f = Fixture::new();
+        f.file("/proc/device-tree/model", b"Amlogic\0");
+        for config in [
+            br#"{"common":{"deviceType":"yandexmicro"}}"#.as_slice(),
+            b"not json",
+        ] {
+            f.file("/system/vendor/quasar/quasar.cfg", config);
+            let r = f.load("auto").unwrap();
+            assert_eq!(r.profile.id, "generic");
+            assert!(!r.capabilities.voice);
+        }
+        assert_eq!(f.load("mini1").unwrap().profile.id, "mini1");
     }
     #[test]
     fn mini2_detection_probes_whole_devices_and_separates_capabilities() {
