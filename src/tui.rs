@@ -93,6 +93,10 @@ fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> 
         "AIRPLAY 2"
     } else if status.retry_required {
         "RETRY REQUIRED"
+    } else if status.login_refused == "premium" {
+        "PREMIUM REQUIRED"
+    } else if !status.login_refused.is_empty() {
+        "LOGIN REQUIRED"
     } else if !status.connected {
         "CONNECTING"
     } else if !status.error.is_empty() {
@@ -908,6 +912,23 @@ mod tests {
         assert!(frame.iter().any(|s| s.ends_with("|   RETRY REQUIRED")));
         assert!(frame.iter().any(|s| s == "Retry available in 12s"));
         assert!(frame.iter().any(|s| s == "Audio key request failed"));
+    }
+    #[test]
+    fn refused_login_replaces_connecting_while_disconnected() {
+        let mut status = Status {
+            login_refused: "credentials".into(),
+            error: "Saved Spotify login was rejected; pair again with spotiya login".into(),
+            ..Default::default()
+        };
+        let frame = lines(&status, "", None, 90);
+        assert!(frame.iter().any(|s| s.ends_with("|   LOGIN REQUIRED")));
+        assert!(frame.iter().any(|s| s.contains("pair again")));
+        status.login_refused = "premium".into();
+        let frame = lines(&status, "", None, 90);
+        assert!(frame.iter().any(|s| s.ends_with("|   PREMIUM REQUIRED")));
+        status.login_refused.clear();
+        let frame = lines(&status, "", None, 90);
+        assert!(frame.iter().any(|s| s.ends_with("|   CONNECTING")));
     }
     #[test]
     fn spectrum_state_is_visible_for_supported_and_other_devices() {

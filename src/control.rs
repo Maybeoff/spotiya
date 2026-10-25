@@ -32,6 +32,8 @@ pub struct Status {
     pub loading: bool,
     pub error: String,
     pub retry_required: bool,
+    /// "credentials" or "premium" when Spotify refused the login and retries stopped.
+    pub login_refused: String,
     pub retry_after_secs: u32,
     pub failed_tracks: u8,
     pub volume: u16,

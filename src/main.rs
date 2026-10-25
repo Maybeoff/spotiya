@@ -540,10 +540,54 @@ fn file_lock(dir: &Path, name: &str) -> io::Result<FileLock> {
     }
     Ok(FileLock(file))
 }
+/// Why Spotify refused a login outright; retrying the same credentials cannot help.
+#[derive(Clone, Copy)]
+enum Rejected {
+    Credentials,
+    Premium,
+}
+impl Rejected {
+    // librespot keeps its login error type private, so the reason is read from the message,
+    // which is fixed in the pinned revision. An unknown reason keeps the normal retries.
+    fn of(e: &Error) -> Option<Self> {
+        if e.kind != librespot::core::error::ErrorKind::PermissionDenied {
+            return None;
+        }
+        let text = e.error.to_string();
+        if text.ends_with("reason: Bad credentials") {
+            Some(Self::Credentials)
+        } else if text.ends_with("reason: Premium account required") {
+            Some(Self::Premium)
+        } else {
+            None
+        }
+    }
+    fn status(self) -> &'static str {
+        match self {
+            Self::Credentials => "Saved Spotify login was rejected; pair again with spotiya login",
+            Self::Premium => "Spotify Premium is required for this account",
+        }
+    }
+    fn key(self) -> &'static str {
+        match self {
+            Self::Credentials => "credentials",
+            Self::Premium => "premium",
+        }
+    }
+    fn reply(self) -> &'static str {
+        match self {
+            Self::Credentials => "Spotify rejected the new login; previous account kept",
+            Self::Premium => {
+                "Spotify Premium is required for the new account; previous account kept"
+            }
+        }
+    }
+}
 fn publish_status(
     s: &Shared,
     playback: &playback::Playback,
     failures: &recovery::Failures,
+    login: Option<Rejected>,
     info: &mut control::Status,
     last: &mut Vec<u8>,
     text: &mut Vec<u8>,
@@ -558,8 +602,14 @@ fn publish_status(
     info.retry_required = failures.blocked();
     info.retry_after_secs = failures.retry_after();
     info.failed_tracks = failures.count();
+    let refused = login.map_or("", Rejected::key);
+    if info.login_refused != refused {
+        info.login_refused = refused.into();
+    }
     info.error = if failures.blocked() {
         failures.message()
+    } else if let Some(rejected) = login {
+        rejected.status().to_owned()
     } else {
         playback.error().to_owned()
     };
@@ -800,6 +850,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let mut credentials = cache.credentials();
     // Credentials that worked before a pending login, restored if the new account cannot connect.
     let mut fallback = None;
+    // Set when Spotify refused the saved login; retries wait for new credentials.
+    let mut rejected = None::<Rejected>;
     let mut spirc: Option<Spirc> = None;
     let mut task: Option<JoinHandle<()>> = None;
     let mut connecting: Option<Connecting> = None;
@@ -855,6 +907,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         &shared,
         &playback,
         &failures,
+        rejected,
         &mut info,
         &mut last_status,
         &mut status_buffer,
@@ -867,7 +920,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 let Some(fresh)=fresh else { eprintln!("receiver: discovery stopped"); break; };
                 audio_guard.set_playing(false);connecting=None;voice_epoch+=1;
                 if let Some(reply)=pending_login.take(){let _=reply.send(Err("Login was replaced by another Spotify device"));}
-                fallback=None;
+                fallback=None;rejected=None;
                 stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
                 failures.reset();retry_track=None;
                 credentials=Some(fresh); retry_at=Instant::now(); backoff=5;
@@ -878,7 +931,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 else {fallback=credentials.take();}
                 stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
                 failures.reset();retry_track=None;
-                credentials=Some(login.credentials);pending_login=Some(login.completed);
+                credentials=Some(login.credentials);pending_login=Some(login.completed);rejected=None;
                 retry_at=Instant::now();backoff=5;
             },
             _=tokio::time::sleep_until(retry_at), if spirc.is_none() && connecting.is_none() && credentials.is_some() && !failures.blocked()=>{
@@ -906,11 +959,13 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     },
                     Some(Err(e))=>{
-                        if let Some(reply)=pending_login.take(){let _=reply.send(Err("Receiver could not connect the new account; previous account kept"));}
+                        let refused=Rejected::of(&e);
+                        if let Some(reply)=pending_login.take(){let _=reply.send(Err(refused.map_or("Receiver could not connect the new account; previous account kept",Rejected::reply)));}
                         eprintln!("receiver: connect failed ({e}); discovery remains available");
                         if e.kind==librespot::core::error::ErrorKind::Unauthenticated {credentials=None;}
                         session.shutdown(); retry_at=Instant::now()+Duration::from_secs(backoff);backoff=(backoff*2).min(60);
                         if let Some(previous)=fallback.take() {credentials=Some(previous);retry_at=Instant::now();backoff=5;eprintln!("receiver: previous account restored");}
+                        else if refused.is_some() {credentials=None;rejected=refused;eprintln!("receiver: retries stopped until a new login");}
                     },
                     None=>{
                         if let Some(reply)=pending_login.take(){let _=reply.send(Err("Receiver connect timed out; previous account kept"));}
@@ -1012,7 +1067,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         if let Err(e)=airplay.set_enabled(enabled){eprintln!("airplay: {e}");}
                         airplay.poll(&shared.airplay).await;
                         airplay.status(&mut info,&shared.airplay);
-                        publish_status(&shared,&playback,&failures,&mut info,&mut last_status,&mut status_buffer);
+                        publish_status(&shared,&playback,&failures,rejected,&mut info,&mut last_status,&mut status_buffer);
                         continue;
                     },
                     voice::Intent::Retry=>{
@@ -1020,7 +1075,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                             retry_track=Some(uri);retry_at=Instant::now();backoff=5;
                             eprintln!("receiver: explicit retry scheduled");
                         } else {eprintln!("receiver: retry unavailable or cooling down");}
-                        publish_status(&shared,&playback,&failures,&mut info,&mut last_status,&mut status_buffer);
+                        publish_status(&shared,&playback,&failures,rejected,&mut info,&mut last_status,&mut status_buffer);
                         continue;
                     },
                     voice::Intent::Voice(enabled)=>{
@@ -1141,6 +1196,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             &shared,
             &playback,
             &failures,
+            rejected,
             &mut info,
             &mut last_status,
             &mut status_buffer,
@@ -1171,6 +1227,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         &shared,
         &playback,
         &failures,
+        rejected,
         &mut info,
         &mut last_status,
         &mut status_buffer,
@@ -1182,6 +1239,26 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_final_login_refusals_stop_retries() {
+        let refusal =
+            |reason: &str| Error::permission_denied(format!("Login failed with reason: {reason}"));
+        assert!(matches!(
+            Rejected::of(&refusal("Bad credentials")),
+            Some(Rejected::Credentials)
+        ));
+        assert!(matches!(
+            Rejected::of(&refusal("Premium account required")),
+            Some(Rejected::Premium)
+        ));
+        assert!(Rejected::of(&refusal("Try another access point")).is_none());
+        assert!(
+            Rejected::of(&Error::unavailable(
+                "Login failed with reason: Bad credentials"
+            ))
+            .is_none()
+        );
+    }
     #[test]
     fn all_volume_percentages_round_trip_through_master() {
         for p in 0..=100 {

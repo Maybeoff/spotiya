@@ -67,6 +67,7 @@ fn offline_status(config: &Config, message: &str) {
     status.receiver_pid = 0;
     status.ducking = false;
     status.retry_required = false;
+    status.login_refused.clear();
     status.retry_after_secs = 0;
     status.failed_tracks = 0;
     status.error = message.to_owned();
