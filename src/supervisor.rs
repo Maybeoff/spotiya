@@ -32,6 +32,7 @@ fn remove_pid(path: &Path, pid: u32) {
         let _ = fs::remove_file(path);
     }
 }
+pub const LOG: &str = "/tmp/spotify-connect.log";
 const LOG_LIMIT: u64 = 256 * 1024;
 pub fn open_log(path: &Path) -> io::Result<File> {
     match trim_log(path) {
@@ -186,11 +187,11 @@ pub async fn run(options: &Options) -> io::Result<()> {
         program: std::env::current_exe()?,
         args,
         state: options.state_dir.clone(),
-        parent_pid: "/run/spotiya-supervisor.pid".into(),
-        child_pid: "/run/spotify-connect.pid".into(),
+        parent_pid: crate::installation::SUPERVISOR_PID.into(),
+        child_pid: crate::installation::RECEIVER_PID.into(),
         stop: "/run/spotify-connect-stop".into(),
-        log: "/tmp/spotify-connect.log".into(),
-        status: "/run/spotiya.status".into(),
+        log: LOG.into(),
+        status: crate::control::STATUS.into(),
         first_delay: Duration::from_secs(2),
         max_delay: Duration::from_secs(60),
         stable_after: Duration::from_secs(60),

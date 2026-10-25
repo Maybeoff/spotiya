@@ -11,6 +11,9 @@ use std::{
 };
 
 pub const BASE: &str = "/data/opt/spotify-connect";
+pub const INIT: &str = "/etc/init.d/S99spotify-connect";
+pub const RECEIVER_PID: &str = "/run/spotify-connect.pid";
+pub const SUPERVISOR_PID: &str = "/run/spotiya-supervisor.pid";
 pub const ASSET: &str = "spotiya-armv7-linux-gnueabihf.tar.gz";
 const FILES: &[&str] = &[
     "spotiya",
@@ -73,6 +76,7 @@ pub fn free_bytes(path: &Path) -> io::Result<u64> {
     u64::try_from(u128::from(stat.f_bavail) * u128::from(stat.f_frsize))
         .map_err(|_| error("Filesystem capacity exceeds supported range"))
 }
+/// The pid in `pidfile`, if that process runs the binary installed in `base`.
 pub fn live_pid(base: &Path, pidfile: &Path) -> Option<u32> {
     let pid: u32 = fs::read_to_string(pidfile).ok()?.trim().parse().ok()?;
     let expected = fs::canonicalize(base.join("spotiya")).ok()?;
@@ -150,7 +154,7 @@ impl Layout {
     fn system() -> Self {
         Self {
             base: BASE.into(),
-            init: "/etc/init.d/S99spotify-connect".into(),
+            init: INIT.into(),
             cli: "/usr/bin/spotiya".into(),
         }
     }
@@ -179,7 +183,7 @@ impl Service for SystemService {
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut ready_since = None;
         while Instant::now() < deadline {
-            let pid = live_pid(Path::new(BASE), Path::new("/run/spotify-connect.pid"));
+            let pid = live_pid(Path::new(BASE), Path::new(RECEIVER_PID));
             let status = fs::read(crate::control::STATUS)
                 .ok()
                 .and_then(|b| serde_json::from_slice::<crate::control::Status>(&b).ok());
@@ -200,7 +204,7 @@ impl Service for SystemService {
 }
 fn service(action: &str) -> io::Result<()> {
     let result = command(
-        Path::new("/etc/init.d/S99spotify-connect"),
+        Path::new(INIT),
         &[OsStr::new(action)],
         Duration::from_secs(12),
     )?;
@@ -512,8 +516,8 @@ pub fn install(root: &Path, binary: &Path, newer_only: bool) -> io::Result<()> {
         .ok_or_else(|| error("Candidate returned an invalid profile"))?;
     let installed = layout.base.join("spotiya").exists();
     let running = !installed
-        || live_pid(&layout.base, Path::new("/run/spotify-connect.pid")).is_some()
-        || live_pid(&layout.base, Path::new("/run/spotiya-supervisor.pid")).is_some();
+        || live_pid(&layout.base, Path::new(RECEIVER_PID)).is_some()
+        || live_pid(&layout.base, Path::new(SUPERVISOR_PID)).is_some();
     let mut mount = RootMount::writable()?;
     let result = transaction(&layout, root, binary, running, profile, &mut SystemService);
     // The transaction outcome matters more than the remount, so neither error hides the other.

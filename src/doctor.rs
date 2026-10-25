@@ -285,9 +285,9 @@ async fn network(report: &mut Report) {
 fn collect(state: &Path) -> Report {
     let mut report = Report::new();
     let base = Path::new(installation::BASE);
-    let pid = installation::live_pid(base, Path::new("/run/spotify-connect.pid"));
+    let pid = installation::live_pid(base, Path::new(installation::RECEIVER_PID));
     let supervisor =
-        installation::live_pid(base, Path::new("/run/spotiya-supervisor.pid")).is_some();
+        installation::live_pid(base, Path::new(installation::SUPERVISOR_PID)).is_some();
     let status = fs::read(crate::control::STATUS)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
@@ -352,7 +352,7 @@ fn collect(state: &Path) -> Report {
         },
     );
     for (source, path) in [
-        ("receiver", "/tmp/spotify-connect.log"),
+        ("receiver", crate::supervisor::LOG),
         ("supervisor", "/tmp/spotify-connect-supervisor.log"),
     ] {
         if let Ok(summary) = log_summary(source, Path::new(path)) {

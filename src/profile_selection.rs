@@ -1,4 +1,7 @@
-use crate::profiles::{self, Profile};
+use crate::{
+    installation::{BASE, INIT, RECEIVER_PID, SUPERVISOR_PID},
+    profiles::{self, Profile},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsStr,
@@ -10,7 +13,6 @@ use std::{
 };
 
 const SETTING: &str = "profile-selection.json";
-const BASE: &str = "/data/opt/spotify-connect";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -241,15 +243,13 @@ fn transaction(
     Ok(())
 }
 fn service_pid(file: &str) -> Option<u32> {
-    let pid = fs::read_to_string(file).ok()?.trim().parse::<u32>().ok()?;
-    let expected = fs::canonicalize(format!("{BASE}/spotiya")).ok()?;
-    (fs::read_link(format!("/proc/{pid}/exe")).ok()? == expected).then_some(pid)
+    crate::installation::live_pid(Path::new(BASE), Path::new(file))
 }
 fn restart(state: &Path, expected: &str) -> io::Result<()> {
     let selection = read(state)?.map_or_else(|| "auto".into(), |s| s.selection);
     // Stop may wait 8 seconds for the receiver, so allow that plus a start.
     let output = crate::installation::command(
-        Path::new("/etc/init.d/S99spotify-connect"),
+        Path::new(INIT),
         &[OsStr::new("restart")],
         Duration::from_secs(20),
     )?;
@@ -260,7 +260,7 @@ fn restart(state: &Path, expected: &str) -> io::Result<()> {
     }
     let deadline = Instant::now() + Duration::from_secs(6);
     while Instant::now() < deadline {
-        if let Some(pid) = service_pid("/run/spotify-connect.pid")
+        if let Some(pid) = service_pid(RECEIVER_PID)
             && let Ok(text) = fs::read_to_string(crate::control::STATUS)
             && let Ok(status) = serde_json::from_str::<crate::control::Status>(&text)
             && status.receiver_pid == pid
@@ -296,9 +296,8 @@ pub fn select(state: &Path, selection: &str) -> io::Result<String> {
     let managed = fs::canonicalize(state).ok().is_some_and(|path| {
         fs::canonicalize(format!("{BASE}/receiver-state")).is_ok_and(|installed| path == installed)
     });
-    let running = managed
-        && (service_pid("/run/spotiya-supervisor.pid").is_some()
-            || service_pid("/run/spotify-connect.pid").is_some());
+    let running =
+        managed && (service_pid(SUPERVISOR_PID).is_some() || service_pid(RECEIVER_PID).is_some());
     if running {
         probe_audio(&target.profile.audio)?;
     }

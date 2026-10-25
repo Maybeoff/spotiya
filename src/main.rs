@@ -410,7 +410,7 @@ fn options() -> Result<Option<Options>, String> {
             "--status" => {
                 print!(
                     "{}",
-                    fs::read_to_string("/run/spotiya.status").map_err(|e| e.to_string())?
+                    fs::read_to_string(control::STATUS).map_err(|e| e.to_string())?
                 );
                 return Ok(None);
             }
@@ -631,8 +631,9 @@ fn publish_status(
     if last == text {
         return;
     }
-    if fs::write("/run/spotiya.status.new", &*text)
-        .and_then(|_| fs::rename("/run/spotiya.status.new", "/run/spotiya.status"))
+    let temporary = Path::new(control::STATUS).with_extension("status.new");
+    if fs::write(&temporary, &*text)
+        .and_then(|_| fs::rename(&temporary, control::STATUS))
         .is_ok()
     {
         std::mem::swap(last, text);
