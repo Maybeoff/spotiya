@@ -769,6 +769,25 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         .parent()
         .ok_or_else(|| io::Error::other("No install directory"))?
         .to_path_buf();
+    let decoder_path = base.join("playplay-decoder");
+    let playplay = if decoder_path.is_file() {
+        match tokio::task::spawn_blocking(move || {
+            librespot::audio::playplay::PlayPlayDecoder::configuration(&decoder_path)
+        })
+        .await?
+        {
+            Ok(config) => {
+                eprintln!("receiver: PlayPlay fallback ready");
+                Some(config)
+            }
+            Err(error) => {
+                eprintln!("receiver: PlayPlay decoder unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut airplay =
         airplay::Runtime::new(&base, &options.state_dir, &options.name, &profile.audio);
     airplay.poll(&shared.airplay).await;
@@ -809,6 +828,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             },
             _=tokio::time::sleep_until(retry_at), if spirc.is_none() && credentials.is_some() && !failures.blocked()=>{
                 session=Session::new(config.clone(),Some(cache.clone()));
+                session.audio_key().set_playplay(playplay.clone());
                 player.set_session(session.clone());
                 let connect=ConnectConfig { name:options.name.clone(), initial_volume:mixer.volume(),
                     volume_steps:100, device_type:DeviceType::Speaker, ..Default::default() };
