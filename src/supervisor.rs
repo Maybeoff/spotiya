@@ -25,17 +25,32 @@ struct Config {
     first_delay: Duration,
     max_delay: Duration,
     stable_after: Duration,
+    trim_every: Duration,
 }
 fn remove_pid(path: &Path, pid: u32) {
     if fs::read_to_string(path).is_ok_and(|s| s.trim() == pid.to_string()) {
         let _ = fs::remove_file(path);
     }
 }
-fn child_log(path: &Path) -> io::Result<File> {
-    if fs::metadata(path).is_ok_and(|m| m.len() >= 256 * 1024) {
-        fs::rename(path, path.with_extension("log.1"))?;
+const LOG_LIMIT: u64 = 256 * 1024;
+pub fn open_log(path: &Path) -> io::Result<File> {
+    match trim_log(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
     }
     OpenOptions::new().create(true).append(true).open(path)
+}
+/// Running children keep the log open for appending, so it is copied aside and
+/// truncated in place; their next write lands at the new end of the file.
+pub fn trim_log(path: &Path) -> io::Result<()> {
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    if file.metadata()?.len() < LOG_LIMIT {
+        return Ok(());
+    }
+    let temporary = path.with_extension("log.1.new");
+    io::copy(&mut file, &mut File::create(&temporary)?)?;
+    fs::rename(temporary, path.with_extension("log.1"))?;
+    file.set_len(0)
 }
 fn offline_status(config: &Config, message: &str) {
     let mut status = fs::read_to_string(&config.status)
@@ -82,6 +97,8 @@ async fn monitor(config: &Config, shutdown: impl Future<Output = ()>) -> io::Res
     tokio::pin!(shutdown);
     let mut poll = tokio::time::interval(Duration::from_millis(100));
     poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut trim = tokio::time::interval(config.trim_every);
+    trim.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut child: Option<Child> = None;
     let mut child_pid = None;
     let mut started = Instant::now();
@@ -91,13 +108,29 @@ async fn monitor(config: &Config, shutdown: impl Future<Output = ()>) -> io::Res
         tokio::select! {
             _=&mut shutdown => break Ok(()),
             _=poll.tick()=>{if config.stop.exists() {break Ok(());}},
+            _=trim.tick(),if child.is_some()=>{
+                if let Err(e)=trim_log(&config.log) {eprintln!("supervisor: log trim failed: {e}");}
+            },
             _=tokio::time::sleep_until(next_start),if child.is_none()=>{
                 if config.stop.exists() {break Ok(());}
                 offline_status(config,"Receiver starting");
-                let output=match child_log(&config.log) {Ok(file)=>file,Err(e)=>break Err(e)};
+                let output=match open_log(&config.log) {Ok(file)=>file,Err(e)=>break Err(e)};
                 let error=match output.try_clone() {Ok(file)=>file,Err(e)=>break Err(e)};
                 let mut command=Command::new(&config.program);
                 command.args(&config.args).stdin(Stdio::null()).stdout(output).stderr(error).kill_on_drop(true);
+                // kill_on_drop does not run when the supervisor is killed, so let the kernel stop
+                // the receiver; SIGTERM lets it shut down its own AirPlay children cleanly.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        if libc::getppid() as u32 != parent {
+                            return Err(io::Error::other("Supervisor exited"));
+                        }
+                        Ok(())
+                    });
+                }
                 match command.spawn() {
                     Ok(process)=>{
                         let Some(pid)=process.id() else {break Err(io::Error::other("Child has no PID"));};
@@ -160,6 +193,7 @@ pub async fn run(options: &Options) -> io::Result<()> {
         first_delay: Duration::from_secs(2),
         max_delay: Duration::from_secs(60),
         stable_after: Duration::from_secs(60),
+        trim_every: Duration::from_secs(30),
     };
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     monitor(&config, async {
@@ -190,6 +224,7 @@ mod tests {
             first_delay: Duration::from_millis(40),
             max_delay: Duration::from_millis(160),
             stable_after: Duration::from_secs(60),
+            trim_every: Duration::from_secs(60),
         };
         (root, config)
     }
@@ -204,6 +239,37 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+    #[test]
+    fn trimming_keeps_the_open_append_handle_writing_from_the_start() {
+        use std::io::Write;
+        let (root, config) = fixture("");
+        let mut writer = open_log(&config.log).unwrap();
+        writer
+            .write_all(&vec![b'x'; LOG_LIMIT as usize - 1])
+            .unwrap();
+        trim_log(&config.log).unwrap();
+        assert!(!root.join("child.log.1").exists());
+        writer.write_all(b"y\n").unwrap();
+        trim_log(&config.log).unwrap();
+        assert_eq!(fs::metadata(&config.log).unwrap().len(), 0);
+        assert_eq!(
+            fs::metadata(root.join("child.log.1")).unwrap().len(),
+            LOG_LIMIT + 1
+        );
+        writer.write_all(b"after\n").unwrap();
+        assert_eq!(fs::read(&config.log).unwrap(), b"after\n");
+        // A new child must not move the file away from writers that already hold it.
+        writer.write_all(&vec![b'z'; LOG_LIMIT as usize]).unwrap();
+        let mut second = open_log(&config.log).unwrap();
+        writer.write_all(b"first\n").unwrap();
+        second.write_all(b"second\n").unwrap();
+        assert_eq!(fs::read(&config.log).unwrap(), b"first\nsecond\n");
+        assert_eq!(
+            fs::metadata(root.join("child.log.1")).unwrap().len(),
+            LOG_LIMIT + 6
+        );
+        fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
     async fn crash_restarts_child_and_manual_stop_kills_and_reaps_it() {
@@ -266,6 +332,7 @@ mod tests {
             first_delay: config.first_delay,
             max_delay: config.max_delay,
             stable_after: config.stable_after,
+            trim_every: config.trim_every,
         };
         let parentfile = config.parent_pid.clone();
         let pidfile = config.child_pid.clone();

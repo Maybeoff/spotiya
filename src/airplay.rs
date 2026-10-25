@@ -1,6 +1,6 @@
 use crate::{control, profiles};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs,
     io::{self, BufRead, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -183,12 +183,7 @@ fn quoted(value: &str) -> String {
             .collect::<String>()
     )
 }
-fn log_file(path: &Path) -> io::Result<File> {
-    if fs::metadata(path).is_ok_and(|m| m.len() >= 256 * 1024) {
-        fs::rename(path, path.with_extension("log.1"))?;
-    }
-    OpenOptions::new().create(true).append(true).open(path)
-}
+const LOG: &str = "/tmp/spotiya-airplay.log";
 
 pub struct Runtime {
     assets: PathBuf,
@@ -199,6 +194,7 @@ pub struct Runtime {
     children: Vec<Child>,
     token: String,
     retry_at: Instant,
+    trimmed: Instant,
     pub enabled: bool,
     pub available: bool,
     pub error: String,
@@ -218,6 +214,7 @@ impl Runtime {
             children: vec![],
             token: String::new(),
             retry_at: Instant::now(),
+            trimmed: Instant::now(),
             enabled,
             available,
             error: String::new(),
@@ -245,7 +242,7 @@ impl Runtime {
         Ok(())
     }
     fn spawn(&mut self, program: &str, args: &[&str]) -> io::Result<u32> {
-        let output = log_file(Path::new("/tmp/spotiya-airplay.log"))?;
+        let output = crate::supervisor::open_log(Path::new(LOG))?;
         let mut cmd = Command::new(self.assets.join(program));
         cmd.args(args)
             .env(
@@ -391,6 +388,12 @@ impl Runtime {
         gate.active.store(false, Ordering::Release);
     }
     pub async fn poll(&mut self, gate: &Gate) {
+        if !self.children.is_empty() && self.trimmed.elapsed() >= Duration::from_secs(30) {
+            self.trimmed = Instant::now();
+            if let Err(e) = crate::supervisor::trim_log(Path::new(LOG)) {
+                eprintln!("airplay: log trim failed: {e}");
+            }
+        }
         if !self.available {
             self.available =
                 crate::addons::airplay_available(self.assets.parent().unwrap().parent().unwrap());

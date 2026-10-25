@@ -907,7 +907,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                     },
                     Some(Err(e))=>{
                         if let Some(reply)=pending_login.take(){let _=reply.send(Err("Receiver could not connect the new account; previous account kept"));}
-                        eprintln!("receiver: connect failed ({:?}); discovery remains available",e.kind);
+                        eprintln!("receiver: connect failed ({e}); discovery remains available");
                         if e.kind==librespot::core::error::ErrorKind::Unauthenticated {credentials=None;}
                         session.shutdown(); retry_at=Instant::now()+Duration::from_secs(backoff);backoff=(backoff*2).min(60);
                         if let Some(previous)=fallback.take() {credentials=Some(previous);retry_at=Instant::now();backoff=5;eprintln!("receiver: previous account restored");}
