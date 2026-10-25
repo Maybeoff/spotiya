@@ -11,3 +11,8 @@ __pycache__/
 /config.json
 /controls/mini2/test-buttons
 /controls/mini2/test-lights
+
+*.apk
+*.sdi
+/decoder/resources.h
+/decoder/playplay-decoder*

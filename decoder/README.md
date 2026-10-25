@@ -1,0 +1,84 @@
+# Локальная сборка PlayPlay-декодера
+
+Spotiya 0.9.2 использует обычный аудиоключ Spotify первым. При явном отказе AP
+она может обратиться к PlayPlay и передать поток отдельному `playplay-decoder`.
+Этот экспериментальный декодер запускает ограниченный набор x86_64-функций
+через Unicorn, в том числе на ARMv7. На Мини 2 проверены звук, чтение и перемотка;
+поддержка всех треков и аккаунтов не проверялась.
+
+В репозитории находятся C-обвязка, адресная раскладка и генератор ресурсов.
+Сам APK, его машинный код и таблицы, готовый декодер, аккаунты и образцы ключей
+не публикуются. Ресурсы создаются локально из APK пользователя. Основной пакет
+Spotiya и задания Actions этого декодера не содержат.
+
+## Входной файл
+
+Нужен Spotify Android **9.1.92.3058**, содержащий
+`lib/x86_64/liborbit-jni-spotify.so` размером **27 955 696 байт** с SHA-256:
+
+```
+c0d5f6a1ccadb6ada0faf32f270c293ff412f5ddc02a3918ab09486970b10a38
+```
+
+Скрипт принимает целый APK или уже извлечённую библиотеку. APK только с ARM
+библиотеками не подходит. Другие сборки отклоняются до извлечения ресурсов:
+адреса функций и данные зависят от точной версии библиотеки.
+
+## Сборка на Linux x86_64
+
+Нужны Python 3 с venv, Git, CMake, Ninja и GCC. Для ARMv7 используется тот же
+Linaro toolchain, что и для Spotiya. Из корня репозитория:
+
+```sh
+python3 -m venv .cache/decoder-venv
+.cache/decoder-venv/bin/pip install -r decoder/requirements.txt
+scripts/bootstrap-arm.sh
+DECODER_PYTHON="$PWD/.cache/decoder-venv/bin/python" \
+  scripts/build-playplay.sh /путь/к/Spotify.apk armv7
+```
+
+Результат — `dist/playplay-decoder-armv7`. На проверенной сборке ARMv7 размер
+составлял 1 129 500 байт; результат может меняться с инструментами сборки.
+Вариант для проверки на ПК: заменить `armv7` на `host`.
+
+Unicorn 2.1.4 загружается из закреплённого коммита
+`8028ec436f2d9376525352dd38ed9ed6b9f6be10`. Его исходники, сборка и сгенерированный
+`resources.h` хранятся в `~/.cache/spotiya/`. Переопределения:
+`SPOTIYA_CACHE`, `SPOTIYA_TOOLCHAIN`, `DECODER_UNICORN`, `DECODER_PYTHON`,
+`SPOTIYA_JOBS`. Входной APK не копируется в репозиторий.
+
+Для одной проверки извлечения без компиляции:
+
+```sh
+.cache/decoder-venv/bin/python decoder/prepare.py \
+  /путь/к/Spotify.apk .cache/decoder-resources/resources.h
+```
+
+Генератор проверяет SHA-256 исходной библиотеки, применяет статические относительные
+релокации ELF и проверяет SHA-256 выделенных страниц. Данные процесса телефона
+и учётной записи не используются.
+
+## Установка на Мини 2
+
+При установленной Spotiya 0.9.2:
+
+```sh
+adb -s SPEAKER_IP:5555 push dist/playplay-decoder-armv7 /tmp/playplay-decoder
+adb -s SPEAKER_IP:5555 shell 'spotiya stop && cp /tmp/playplay-decoder /data/opt/spotify-connect/playplay-decoder && chmod 755 /data/opt/spotify-connect/playplay-decoder && spotiya start'
+```
+
+После запуска в журнале должно появиться `PlayPlay fallback ready`.
+`playplay-decoder --info` показывает размер ресурсов и версию протокола;
+команда не подключается к сети. Декодер не получает токены аккаунта и работает
+через stdin/stdout с родительским процессом. Для отключения остановите Spotiya,
+удалите `playplay-decoder` из её каталога и запустите Spotiya снова.
+
+На Мини 1 этот путь пока не проверялся.
+
+## Исходники и лицензии
+
+C-обвязка и генератор распространяются под [MIT](../LICENSE).
+Отдельный исполняемый файл статически использует
+[Unicorn](https://github.com/unicorn-engine/unicorn/tree/8028ec436f2d9376525352dd38ed9ed6b9f6be10)
+с его GPL-2.0 и уведомлениями зависимостей; он не линкуется в основной бинарник
+Spotiya. Фрагменты исходного APK остаются локальным входом сборки.
