@@ -55,7 +55,7 @@ cmake --build "$DECODER_BUILD/unicorn" -j "${SPOTIYA_JOBS:-4}"
 "$DECODER_CC" $DECODER_FLAGS -std=c11 -Wall -Wextra -Werror \
     -I "$DECODER_UNICORN/include" -I "$DECODER_BUILD/generated" \
     "$SPOTIYA_ROOT/decoder/decoder.c" "$DECODER_BUILD/unicorn/libunicorn.a" \
-    -Wl,--gc-sections -Wl,-z,noexecstack -Wl,-z,max-page-size=4096 \
+    -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,-z,noexecstack -Wl,-z,max-page-size=4096 \
     -lm -lpthread -ldl -o "$DECODER_BUILD/playplay-decoder"
 "$DECODER_STRIP" "$DECODER_BUILD/playplay-decoder"
 cp "$DECODER_BUILD/playplay-decoder" "$SPOTIYA_ROOT/dist/playplay-decoder-$DECODER_TARGET"

@@ -1,3 +1,4 @@
+#define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <inttypes.h>
@@ -8,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 #include <unicorn/unicorn.h>
@@ -23,6 +25,7 @@
 #define SOURCE UINT64_C(0x20003500)
 #define DESTINATION UINT64_C(0x2000a000)
 #define MAX_CHUNK 24576
+#define JIT_BUFFER_BYTES (1024U * 1024U)
 #define HEAP_END UINT64_C(0x21200000)
 _Static_assert(SOURCE + MAX_CHUNK <= DESTINATION, "input/output buffers overlap");
 _Static_assert(DESTINATION + MAX_CHUNK <= UINT64_C(0x20010000), "output exceeds data mapping");
@@ -267,17 +270,35 @@ static bool invoke(struct engine *e, uint64_t address, const uint64_t *args, siz
     return run(e, address, RETURN_PC, 10000000);
 }
 
+static void release_image_pages(void) {
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return;
+    uintptr_t begin = (uintptr_t)initial_image;
+    uintptr_t end = begin + sizeof(initial_image);
+    uintptr_t page = (uintptr_t)page_size;
+    begin += (page - begin % page) % page;
+    end -= end % page;
+    /* Unicorn owns a copy; the original file-backed image can be faulted in again on rekey. */
+    if (end > begin) (void)madvise((void *)begin, end - begin, MADV_DONTNEED);
+}
+
 static bool initialize(struct engine *e) {
     uc_err error = uc_open(UC_ARCH_X86, UC_MODE_64, &e->uc);
     if (error != UC_ERR_OK) { fprintf(stderr, "decoder: uc_open: %s\n", uc_strerror(error)); return false; }
     e->heap = 0x21000000; e->random = 0x12345678; e->current_site = -1;
-    error = uc_ctl_set_tcg_buffer_size(e->uc, 2U * 1024U * 1024U);
+    error = uc_ctl_set_tcg_buffer_size(e->uc, JIT_BUFFER_BYTES);
     if (error != UC_ERR_OK) return fail(e, "JIT buffer", error);
-    for (size_t i = 0; i < ARRAY_SIZE(image_pages); ++i) {
-        error = uc_mem_map(e->uc, image_pages[i], 4096, UC_PROT_ALL);
+    for (size_t i = 0; i < ARRAY_SIZE(image_pages);) {
+        size_t next = i + 1;
+        while (next < ARRAY_SIZE(image_pages) && image_pages[next] == image_pages[next - 1] + 4096)
+            ++next;
+        size_t length = (next - i) * 4096;
+        error = uc_mem_map(e->uc, image_pages[i], length, UC_PROT_ALL);
         if (error != UC_ERR_OK) return fail(e, "image map", error);
-        if (!memory_write(e, image_pages[i], initial_image + 4096 * i, 4096)) return false;
+        if (!memory_write(e, image_pages[i], initial_image + 4096 * i, length)) return false;
+        i = next;
     }
+    release_image_pages();
     const uint64_t regions[][2] = {{0x20000000,0x10000},{0x21000000,0x200000},{0x30000000,0x100000},{0x40000000,0x1000}};
     for (size_t i = 0; i < ARRAY_SIZE(regions); ++i) {
         error = uc_mem_map(e->uc, regions[i][0], regions[i][1], UC_PROT_ALL);
@@ -403,7 +424,7 @@ done:
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--serve") == 0) return serve();
     if (argc == 2 && strcmp(argv[1], "--info") == 0) {
-        printf("{\"static_image_bytes\":%zu,\"mapped_pages\":%zu,\"jit_buffer_bytes\":2097152,\"protocol_version\":1,\"network\":false}\n", sizeof(initial_image), ARRAY_SIZE(image_pages));
+        printf("{\"static_image_bytes\":%zu,\"mapped_pages\":%zu,\"jit_buffer_bytes\":%u,\"protocol_version\":1,\"network\":false}\n", sizeof(initial_image), ARRAY_SIZE(image_pages), JIT_BUFFER_BYTES);
         return 0;
     }
     if ((argc != 6 && argc != 7) || strcmp(argv[1], "--decode-range") || (argc == 7 && strcmp(argv[6], "--stats"))) {
