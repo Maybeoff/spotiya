@@ -47,6 +47,7 @@ mod playplay;
 mod profile_selection;
 mod profiles;
 mod recovery;
+mod screen;
 mod spectrum;
 mod supervisor;
 mod tui;
@@ -814,10 +815,18 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let (login_tx, mut login_rx) = mpsc::channel::<auth::Login>(1);
     let control_config = config.clone();
     let (airplay_tx, mut airplay_rx) = mpsc::channel::<airplay::Request>(8);
+    let control_spectrum = shared.spectrum.clone();
     let voice_control = tokio::spawn(async move {
-        if control::serve(voice_tx, login_tx, control_config, caps, airplay_tx)
-            .await
-            .is_err()
+        if control::serve(
+            voice_tx,
+            login_tx,
+            control_config,
+            caps,
+            airplay_tx,
+            control_spectrum,
+        )
+        .await
+        .is_err()
         {
             eprintln!("voice: local control socket unavailable");
         }

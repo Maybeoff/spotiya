@@ -90,6 +90,7 @@ pub async fn serve(
     config: SessionConfig,
     capabilities: crate::profiles::Capabilities,
     airplay: mpsc::Sender<crate::airplay::Request>,
+    spectrum: Arc<crate::spectrum::Spectrum>,
 ) -> io::Result<()> {
     let _ = fs::remove_file(voice::CONTROL);
     let listener = UnixListener::bind(voice::CONTROL)?;
@@ -117,6 +118,7 @@ pub async fn serve(
         let config = config.clone();
         let airplay = airplay.clone();
         let login_lock = login_lock.clone();
+        let spectrum = spectrum.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let mut reader = BufReader::new(socket).take(512);
@@ -152,6 +154,8 @@ pub async fn serve(
                 } else {
                     "ERROR AirPlay handover failed\n".into()
                 }
+            } else if line.trim() == "LEVELS" {
+                levels(spectrum.frame())
             } else if line.trim() == "STATUS" {
                 fs::read_to_string(STATUS).unwrap_or_else(|_| "ERROR Status unavailable\n".into())
             } else if let Some(intent) = parse(&line) {
@@ -206,6 +210,22 @@ pub async fn serve(
             let _ = socket.write_all(reply.as_bytes()).await;
         });
     }
+}
+/// The live spectrum for the TUI graph; `-` while it is off or no audio is playing.
+fn levels(frame: Option<[u8; 4]>) -> String {
+    frame.map_or_else(
+        || "LEVELS -\n".into(),
+        |[a, b, c, d]| format!("LEVELS {a} {b} {c} {d}\n"),
+    )
+}
+/// Parses a `LEVELS` reply; `None` when no spectrum is available.
+pub fn parse_levels(reply: &str) -> Option<[u8; 4]> {
+    let mut values = reply.trim().strip_prefix("LEVELS ")?.split(' ');
+    let mut levels = [0; 4];
+    for level in &mut levels {
+        *level = values.next()?.parse::<u8>().ok()?.min(100);
+    }
+    values.next().is_none().then_some(levels)
 }
 pub fn request(command: &str) -> io::Result<String> {
     let mut socket = std::os::unix::net::UnixStream::connect(voice::CONTROL)?;
@@ -264,5 +284,17 @@ mod tests {
         assert_eq!(parse("SPECTRUM 1"), None);
         assert_eq!(parse("RETRY"), Some(Intent::Retry));
         assert_eq!(parse("RETRY extra"), None);
+    }
+    #[test]
+    fn spectrum_levels_round_trip_and_reject_malformed_replies() {
+        assert_eq!(
+            parse_levels(&levels(Some([0, 40, 100, 7]))),
+            Some([0, 40, 100, 7])
+        );
+        assert_eq!(parse_levels(&levels(None)), None);
+        assert_eq!(parse_levels("LEVELS 1 2 3"), None);
+        assert_eq!(parse_levels("LEVELS 1 2 3 4 5"), None);
+        assert_eq!(parse_levels("LEVELS 1 2 3 x"), None);
+        assert_eq!(parse_levels("LEVELS 1 2 3 255"), Some([1, 2, 3, 100]));
     }
 }

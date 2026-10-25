@@ -1,4 +1,7 @@
-use crate::control::{self, Status};
+use crate::{
+    control::{self, Status},
+    screen::{self, Area, Canvas, Rgb, Screen, Style},
+};
 use std::{
     fs,
     io::{self, IsTerminal, Write},
@@ -124,172 +127,553 @@ fn size() -> (usize, usize) {
 fn safe(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
 }
-fn clock(ms: u32) -> String {
-    let s = ms / 1000;
-    format!("{}:{:02}", s / 60, s % 60)
-}
-fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> Vec<String> {
-    let state = if status.airplay_active {
-        "AIRPLAY 2"
+fn state(status: &Status) -> (&'static str, Rgb) {
+    if status.airplay_active {
+        ("AIRPLAY 2", screen::AIRPLAY)
     } else if status.retry_required {
-        "RETRY REQUIRED"
+        ("RETRY REQUIRED", screen::ERROR)
     } else if status.login_refused == "premium" {
-        "PREMIUM REQUIRED"
+        ("PREMIUM REQUIRED", screen::ERROR)
     } else if !status.login_refused.is_empty() {
-        "LOGIN REQUIRED"
+        ("LOGIN REQUIRED", screen::ERROR)
     } else if !status.connected {
-        "CONNECTING"
+        ("CONNECTING", screen::INFO)
     } else if !status.error.is_empty() {
-        "UNAVAILABLE"
+        ("UNAVAILABLE", screen::ERROR)
     } else if status.loading {
-        "LOADING"
+        ("LOADING", screen::INFO)
     } else if !status.active {
-        "READY"
+        ("READY", screen::DIM)
     } else if status.paused {
-        "PAUSED"
+        ("PAUSED", screen::WARN)
     } else {
-        "PLAYING"
+        ("PLAYING", screen::ACCENT)
+    }
+}
+/// Two samples per column; enough for any terminal a person can open.
+const HISTORY: usize = 8192;
+/// Recent spectrum levels, newest last, for the scrolling graph.
+#[derive(Default)]
+struct History(std::collections::VecDeque<[u8; 4]>);
+impl History {
+    fn push(&mut self, levels: [u8; 4]) {
+        if self.0.len() == HISTORY {
+            self.0.pop_front();
+        }
+        self.0.push_back(levels);
+    }
+    fn series(&self, bands: std::ops::Range<usize>) -> Vec<u8> {
+        self.0
+            .iter()
+            .map(|levels| levels[bands.clone()].iter().copied().max().unwrap_or(0))
+            .collect()
+    }
+}
+const GEOSYNC: &str = "/data/quasar/data/geosync.state";
+/// Reads one protobuf varint from the front of `data`.
+fn varint(data: &mut &[u8]) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let (&byte, rest) = data.split_first()?;
+        *data = rest;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+/// Skips one protobuf field value of `wire` type; `None` for types Quasar does not use here.
+fn skip(data: &mut &[u8], wire: u64) -> Option<()> {
+    match wire {
+        0 => {
+            varint(data)?;
+        }
+        1 => *data = data.get(8..)?,
+        2 => {
+            let length = usize::try_from(varint(data)?).ok()?;
+            *data = data.get(length..)?;
+        }
+        5 => *data = data.get(4..)?,
+        _ => return None,
+    }
+    Some(())
+}
+/// The station clock runs in UTC. Quasar keeps the speaker's time zone in `geosync.state`
+/// as field 2 { 1: name, 2: offset in seconds }; field 1, the location, is skipped unread.
+fn geosync_offset(mut data: &[u8]) -> Option<i64> {
+    while !data.is_empty() {
+        let key = varint(&mut data)?;
+        if key != (2 << 3 | 2) {
+            skip(&mut data, key & 7)?;
+            continue;
+        }
+        let length = usize::try_from(varint(&mut data)?).ok()?;
+        let mut zone = data.get(..length)?;
+        data = data.get(length..)?;
+        while !zone.is_empty() {
+            let key = varint(&mut zone)?;
+            if key == 2 << 3 {
+                // int32: a negative offset arrives as a sign-extended 64-bit varint.
+                return Some(varint(&mut zone)? as i64);
+            }
+            skip(&mut zone, key & 7)?;
+        }
+    }
+    None
+}
+/// Seconds east of UTC for the header clock: the host wrapper's value, else the station's.
+fn utc_offset() -> Option<i64> {
+    std::env::var("SPOTIYA_UTC_OFFSET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            fs::read(GEOSYNC)
+                .ok()
+                .and_then(|data| geosync_offset(&data))
+        })
+        .filter(|s: &i64| s.abs() <= 14 * 3600)
+}
+fn local_clock(offset: Option<i64>) -> String {
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
+    let converted = match offset {
+        Some(offset) => unsafe { libc::gmtime_r(&(now + offset as libc::time_t), &mut tm) },
+        None => unsafe { libc::localtime_r(&now, &mut tm) },
     };
-    let voice = if !status.voice_supported {
-        "unavailable"
-    } else if status.voice {
-        "on"
-    } else {
-        "off"
+    if converted.is_null() {
+        return String::new();
+    }
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+/// One feature row of the receiver panel: name, a coloured dot and its state.
+fn feature(c: &mut Canvas, area: Area, row: usize, name: &str, value: &str, colour: Rgb) {
+    let y = area.y + row;
+    c.text(area.x, y, area.w, name, Style::new(screen::DIM));
+    let x = area.x + 10;
+    if x + 2 < area.x + area.w {
+        let dot = if colour == screen::DIM { '○' } else { '●' };
+        c.put(x, y, dot, Style::new(colour));
+        c.text(
+            x + 2,
+            y,
+            area.x + area.w - x - 2,
+            value,
+            Style::new(screen::TEXT),
+        );
+    }
+}
+fn dashboard(
+    status: &Status,
+    notice: &str,
+    prompt: Option<&[u8]>,
+    history: &History,
+    clock: &str,
+    width: usize,
+    height: usize,
+) -> Canvas {
+    let mut c = Canvas::new(width, height);
+    if width < 40 || height < 12 {
+        c.text(
+            0,
+            0,
+            width,
+            "Enlarge the terminal for spotiya",
+            Style::new(screen::WARN),
+        );
+        let (label, colour) = state(status);
+        c.text(0, 1, width, label, Style::bold(colour));
+        for (i, line) in status
+            .error
+            .lines()
+            .chain(notice.lines())
+            .flat_map(|line| screen::wrap(line, width.max(1)))
+            .take(height.saturating_sub(2))
+            .enumerate()
+        {
+            c.text(0, 2 + i, width, &line, Style::new(screen::TEXT));
+        }
+        return c;
+    }
+    let global: &[(&str, &str)] = &[
+        // Most needed first: a narrow edge keeps as many as fit, in this order.
+        ("/", "search"),
+        ("q", "quit"),
+        ("l", "login"),
+        ("d", "profile"),
+        ("x", "release"),
+        ("r", "retry"),
+    ];
+    // Header: state, speaker and profile.
+    let header = Area {
+        x: 0,
+        y: 0,
+        w: width,
+        h: 3,
     };
-    let guard = if status.airplay_active {
+    c.panel(header, "spotiya", &[]);
+    c.text_right(
+        width - 2,
+        0,
+        &format!(" v{} · {clock} ", env!("CARGO_PKG_VERSION")),
+        Style::new(screen::DIM),
+    );
+    let (label, colour) = state(status);
+    let inner = header.inner();
+    let mut x = inner.x;
+    x += c.text(x, inner.y, inner.w, "● ", Style::new(colour));
+    x += c.text(
+        x,
+        inner.y,
+        inner.w.saturating_sub(x - inner.x),
+        label,
+        Style::bold(colour),
+    );
+    let place = [status.name.as_str(), status.profile.as_str()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    if !place.is_empty() {
+        let room = inner.w.saturating_sub(x - inner.x);
+        c.text(
+            x,
+            inner.y,
+            room,
+            &format!("  {place}"),
+            Style::new(screen::TEXT),
+        );
+    }
+    let output = if status.airplay_active {
         "AirPlay priority"
     } else if status.native_guard {
         "Spotify priority"
     } else {
-        "idle"
+        ""
     };
-    let cells = width.saturating_sub(18).min(42);
-    let filled = if status.duration_ms == 0 {
-        0
-    } else {
-        ((u64::from(status.position_ms) * cells as u64) / u64::from(status.duration_ms))
-            .min(cells as u64) as usize
-    };
-    let mut out = vec![
-        format!(
-            "SPOTIYA                         v{}",
-            env!("CARGO_PKG_VERSION")
-        ),
-        String::new(),
-        format!("{}   |   {}", safe(&status.name), state),
-        format!("Profile: {}", safe(&status.profile)),
-        format!(
-            "Volume {:3}%   Voice {}   Audio: {}{}",
-            status.volume,
-            voice,
-            guard,
-            if status.ducking {
-                "   Alice: ducked"
-            } else {
-                ""
-            }
-        ),
-        format!(
-            "Spectrum: {}",
-            if !status.spectrum_supported {
-                "unavailable"
-            } else if status.spectrum {
-                "on"
-            } else {
-                "off"
-            }
-        ),
-        format!(
-            "AirPlay 2: {}{}",
-            if !status.airplay_available {
-                "not installed"
-            } else if !status.airplay_enabled {
-                "off"
-            } else if status.airplay_running {
-                "on"
-            } else {
-                "starting"
-            },
-            if status.airplay_error.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", safe(&status.airplay_error))
-            }
-        ),
-        String::new(),
-        safe(if status.airplay_active {
-            "AirPlay audio"
-        } else if status.title.is_empty() {
-            "No track selected"
-        } else {
-            &status.title
-        }),
-        safe(&status.artist),
-        safe(&status.album),
-        format!(
-            "{} [{}{}] {}",
-            clock(status.position_ms),
-            "=".repeat(filled),
-            "-".repeat(cells - filled),
-            clock(status.duration_ms)
-        ),
-        String::new(),
-        "Space pause/play   n next   p previous   +/- volume".into(),
-        "/ search   l login   v voice   e spectrum on/off   a add-ons".into(),
-        "r retry   d device profile   x release to Alice   q quit".into(),
-        String::new(),
-    ];
-    if !status.error.is_empty() {
-        out.push(safe(&status.error));
-        if status.retry_required {
-            out.push(if status.retry_after_secs > 0 {
-                format!("Retry available in {}s", status.retry_after_secs)
-            } else {
-                "Press r to retry".into()
-            });
-        }
+    if !output.is_empty() && inner.w > 60 {
+        c.text_right(inner.x + inner.w, inner.y, output, Style::new(screen::DIM));
     }
-    out.extend(notice.lines().map(safe));
+    // Messages under the track: search prompt, errors, then notices.
+    let mut messages: Vec<(String, Style)> = vec![];
     if let Some(input) = prompt {
-        out.push(format!(
-            "Search: {}_",
-            safe(&String::from_utf8_lossy(input))
+        messages.push((
+            format!("search › {}▏", String::from_utf8_lossy(input)),
+            Style::bold(screen::ACCENT),
         ));
     }
-    out
-}
-fn draw(status: &Status, notice: &str, prompt: Option<&[u8]>) -> io::Result<()> {
-    let (width, height) = size();
-    draw_lines(lines(status, notice, prompt, width), width, height)
-}
-fn draw_lines(content: Vec<String>, width: usize, height: usize) -> io::Result<()> {
-    let mut frame = String::from("\x1b[H");
-    for (i, line) in content
-        .into_iter()
-        .take(height.saturating_sub(1))
-        .enumerate()
-    {
-        if i == 0 {
-            frame.push_str("\x1b[1;32m");
+    if !status.error.is_empty() {
+        messages.push((status.error.clone(), Style::new(screen::ERROR)));
+        if status.retry_required {
+            messages.push((
+                if status.retry_after_secs > 0 {
+                    format!("Retry available in {}s", status.retry_after_secs)
+                } else {
+                    "Press r to retry".into()
+                },
+                Style::new(screen::WARN),
+            ));
         }
-        // Most metadata is Latin/Cyrillic; conservative clipping leaves room for
-        // double-width characters and keeps control sequences out of the terminal.
-        let mut used = 0;
-        for c in line.chars() {
-            let cells = if c as u32 >= 0x1100 { 2 } else { 1 };
-            if used + cells > width.saturating_sub(1) {
-                break;
-            }
-            frame.push(c);
-            used += cells;
-        }
-        frame.push_str("\x1b[0m\x1b[K\r\n");
     }
-    frame.push_str("\x1b[J");
+    messages.extend(
+        notice
+            .lines()
+            .map(|l| (l.to_owned(), Style::new(screen::DIM))),
+    );
+    let side = width >= 76;
+    let right_w = if side { 36 } else { width };
+    let left_w = if side { width - right_w } else { width };
+    let text_w = left_w.saturating_sub(4).max(1);
+    // Long names and messages wrap; a pairing URL and code must stay readable in full.
+    let title = if status.airplay_active {
+        "AirPlay audio"
+    } else if status.title.is_empty() {
+        "No track selected"
+    } else {
+        &status.title
+    };
+    let mut titles = screen::wrap(title, text_w);
+    titles.truncate(2);
+    let detail = [status.artist.as_str(), status.album.as_str()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let mut details = screen::wrap(&detail, text_w);
+    details.truncate(2);
+    let mut lines: Vec<(String, Style)> = messages
+        .iter()
+        .flat_map(|(text, style)| screen::wrap(text, text_w).into_iter().map(|l| (l, *style)))
+        .collect();
+    lines.truncate(5);
+    // Title, artist, gap, progress, gap, then the messages.
+    let middle_h = 2 + titles.len() + details.len() + 3 + lines.len().max(1);
+    let left = Area {
+        x: 0,
+        y: header.h,
+        w: left_w,
+        h: middle_h,
+    };
+    let right = if side {
+        Area {
+            x: left.w,
+            y: header.h,
+            w: right_w,
+            h: middle_h,
+        }
+    } else {
+        Area {
+            x: 0,
+            y: header.h + middle_h,
+            w: width,
+            h: 7,
+        }
+    };
+    // Now playing.
+    let toggle = if status.active && !status.paused {
+        "pause"
+    } else {
+        "play"
+    };
+    c.panel(
+        left,
+        "now playing",
+        &[("␣", toggle), ("n", "next"), ("p", "prev"), ("+-", "vol")],
+    );
+    let inner = left.inner();
+    let title_style = if status.title.is_empty() && !status.airplay_active {
+        Style::new(screen::DIM)
+    } else {
+        Style::bold(screen::TITLE)
+    };
+    let mut y = inner.y;
+    for line in &titles {
+        c.text(inner.x, y, inner.w, line, title_style);
+        y += 1;
+    }
+    for line in &details {
+        c.text(inner.x, y, inner.w, line, Style::new(screen::TEXT));
+        y += 1;
+    }
+    let elapsed = clock_text(status.position_ms);
+    let total = clock_text(status.duration_ms);
+    let bar_w = inner.w.saturating_sub(elapsed.len() + total.len() + 2);
+    let progress_y = y + 1;
+    c.text(
+        inner.x,
+        progress_y,
+        inner.w,
+        &elapsed,
+        Style::new(screen::TEXT),
+    );
+    let fraction = if status.duration_ms == 0 {
+        0.0
+    } else {
+        status.position_ms.min(status.duration_ms) as f32 / status.duration_ms as f32
+    };
+    c.bar(
+        inner.x + elapsed.len() + 1,
+        progress_y,
+        bar_w,
+        fraction,
+        ('━', '─'),
+        &[screen::ACCENT, screen::INFO],
+    );
+    c.text_right(
+        inner.x + inner.w,
+        progress_y,
+        &total,
+        Style::new(screen::TEXT),
+    );
+    for (i, (text, style)) in lines.iter().enumerate() {
+        c.text(inner.x, progress_y + 2 + i, inner.w, text, *style);
+    }
+    // Receiver features.
+    c.panel(
+        right,
+        "receiver",
+        &[("v", "voice"), ("e", "spectrum"), ("a", "add-ons")],
+    );
+    let inner = right.inner();
+    c.text(inner.x, inner.y, inner.w, "volume", Style::new(screen::DIM));
+    let percent = format!("{:>3}%", status.volume);
+    let meter_w = inner.w.saturating_sub(10 + percent.len() + 1).min(24);
+    c.bar(
+        inner.x + 10,
+        inner.y,
+        meter_w,
+        f32::from(status.volume) / 100.0,
+        ('■', '■'),
+        &screen::HEAT,
+    );
+    c.text(
+        inner.x + 11 + meter_w,
+        inner.y,
+        percent.len(),
+        &percent,
+        Style::new(screen::TEXT),
+    );
+    let toggle = |supported: bool, on: bool| {
+        if !supported {
+            ("n/a", screen::DIM)
+        } else if on {
+            ("on", screen::ACCENT)
+        } else {
+            ("off", screen::DIM)
+        }
+    };
+    let (value, colour) = toggle(status.voice_supported, status.voice);
+    feature(&mut c, inner, 1, "voice", value, colour);
+    let (value, colour) = toggle(status.spectrum_supported, status.spectrum);
+    feature(&mut c, inner, 2, "spectrum", value, colour);
+    let (value, colour) = if !status.airplay_available {
+        ("not installed", screen::DIM)
+    } else if !status.airplay_enabled {
+        ("off", screen::DIM)
+    } else if !status.airplay_error.is_empty() {
+        ("error", screen::ERROR)
+    } else if status.airplay_running {
+        ("on", screen::ACCENT)
+    } else {
+        ("starting", screen::WARN)
+    };
+    feature(&mut c, inner, 3, "airplay", value, colour);
+    let (value, colour) = if status.ducking {
+        ("ducked for Alice", screen::WARN)
+    } else {
+        ("idle", screen::DIM)
+    };
+    feature(&mut c, inner, 4, "alice", value, colour);
+    // Spectrum history fills the rest of the screen.
+    let top = right.y + right.h;
+    let rest = height.saturating_sub(top);
+    if rest < 4 {
+        // No room for the graph; the global keys move to the bottom edge of the header.
+        c.panel(header, "spotiya", global);
+        return c;
+    }
+    let area = Area {
+        x: 0,
+        y: top,
+        w: width,
+        h: rest,
+    };
+    c.panel(area, "spectrum", global);
+    let inner = area.inner();
+    let hint = if !status.spectrum_supported {
+        Some("The spectrum is not available on this device")
+    } else if !status.spectrum {
+        Some("Spectrum is off; press e to turn it on")
+    } else {
+        None
+    };
+    if let Some(hint) = hint {
+        let w = screen::text_width(hint).min(inner.w);
+        c.text(
+            inner.x + (inner.w - w) / 2,
+            inner.y + inner.h / 2,
+            inner.w,
+            hint,
+            Style::new(screen::DIM),
+        );
+        return c;
+    }
+    let groups: &[(&str, std::ops::Range<usize>)] = match inner.h {
+        0 => &[],
+        1 => &[("all", 0..4)],
+        2 | 3 => &[("low", 0..2), ("high", 2..4)],
+        _ => &[
+            ("bass", 0..1),
+            ("low mid", 1..2),
+            ("high mid", 2..3),
+            ("treble", 3..4),
+        ],
+    };
+    let label_w = 9;
+    for (i, (name, bands)) in groups.iter().enumerate() {
+        let y0 = inner.y + i * inner.h / groups.len();
+        let y1 = inner.y + (i + 1) * inner.h / groups.len();
+        let graph = Area {
+            x: inner.x,
+            y: y0,
+            w: inner.w.saturating_sub(label_w),
+            h: y1 - y0,
+        };
+        c.graph(graph, &history.series(bands.clone()), &screen::HEAT);
+        let level = history
+            .0
+            .back()
+            .map_or(0, |l| l[bands.clone()].iter().copied().max().unwrap_or(0));
+        c.text_right(inner.x + inner.w, y0, name, Style::new(screen::DIM));
+        if y1 - y0 > 1 {
+            c.text_right(
+                inner.x + inner.w,
+                y0 + 1,
+                &format!("{level}%"),
+                Style::new(screen::TEXT),
+            );
+        }
+    }
+    c
+}
+fn clock_text(ms: u32) -> String {
+    let s = ms / 1000;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+/// Menus keep their text layout; this frames it like the dashboard.
+fn menu(content: Vec<String>, width: usize, height: usize) -> Canvas {
+    let mut c = Canvas::new(width, height);
+    let mut lines = content.into_iter();
+    let title = lines
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches("SPOTIYA — ")
+        .to_lowercase();
+    let area = Area {
+        x: 0,
+        y: 0,
+        w: width,
+        h: height,
+    };
+    c.panel(area, &format!("spotiya · {title}"), &[]);
+    let inner = area.inner();
+    let mut y = inner.y;
+    for line in lines.skip_while(|l| l.is_empty()) {
+        let style = if line.starts_with('>') {
+            Style::bold(screen::ACCENT)
+        } else if line.starts_with("Press x again") {
+            Style::bold(screen::WARN)
+        } else if line.contains("   [") || line.starts_with("  ") {
+            Style::new(screen::TEXT)
+        } else {
+            Style::new(screen::DIM)
+        };
+        // List entries keep their indent on wrapped lines.
+        let indent = if line.starts_with(['>', ' ']) { 2 } else { 0 };
+        let parts = screen::wrap(&line, inner.w.saturating_sub(indent).max(1));
+        for (i, part) in parts.iter().enumerate() {
+            if y >= inner.y + inner.h {
+                return c;
+            }
+            let x = inner.x + if i > 0 { indent } else { 0 };
+            c.text(x, y, inner.w, part, style);
+            y += 1;
+        }
+    }
+    c
+}
+fn show(screen: &mut Screen, canvas: &Canvas) -> io::Result<()> {
+    let frame = screen.frame(canvas);
+    if frame.is_empty() {
+        return Ok(());
+    }
     let mut out = io::stdout();
     out.write_all(frame.as_bytes())?;
     out.flush()
+}
+fn draw_lines(screen: &mut Screen, content: Vec<String>) -> io::Result<()> {
+    let (width, height) = size();
+    show(screen, &menu(content, width, height))
 }
 struct ProfileMenu {
     entries: Vec<crate::profile_selection::Choice>,
@@ -373,9 +757,8 @@ impl ProfileMenu {
         out.push(safe(&self.notice));
         out
     }
-    fn draw(&self) -> io::Result<()> {
-        let (width, height) = size();
-        draw_lines(self.lines(height), width, height)
+    fn draw(&self, screen: &mut Screen) -> io::Result<()> {
+        draw_lines(screen, self.lines(size().1))
     }
 }
 #[derive(Default)]
@@ -509,13 +892,14 @@ impl AddonMenu {
         out.extend(notice.lines().map(safe));
         out
     }
-    fn draw(&self, status: &Status, installing: Option<&str>, notice: &str) -> io::Result<()> {
-        let (width, height) = size();
-        draw_lines(
-            self.lines(status, height, installing, notice),
-            width,
-            height,
-        )
+    fn draw(
+        &self,
+        screen: &mut Screen,
+        status: &Status,
+        installing: Option<&str>,
+        notice: &str,
+    ) -> io::Result<()> {
+        draw_lines(screen, self.lines(status, size().1, installing, notice))
     }
 }
 pub fn run(state_dir: &Path, show_addons: bool) -> io::Result<()> {
@@ -534,7 +918,8 @@ fn session(state_dir: &Path, show_addons: bool) -> io::Result<()> {
     let mut addon_job: Option<crate::addons::InstallJob> = None;
     let _terminal = Terminal::enter()?;
     let mut status = Status::default();
-    let mut notice = "Ready. / searches Spotify; l pairs an account.".to_owned();
+    // Key hints live in the panel borders, so the message line starts empty.
+    let mut notice = String::new();
     let mut prompt: Option<Vec<u8>> = None;
     let mut profiles: Option<ProfileMenu> = None;
     let mut addons = show_addons.then(AddonMenu::default);
@@ -542,6 +927,10 @@ fn session(state_dir: &Path, show_addons: bool) -> io::Result<()> {
     let mut addon_notice = String::new();
     let (updates, rx) = mpsc::channel::<String>();
     let mut login_socket: Option<std::os::unix::net::UnixStream> = None;
+    let mut screen = Screen::new(screen::Colors::detect());
+    let mut history = History::default();
+    let offset = utc_offset();
+    let mut last_level = Instant::now();
     let mut last_draw = Instant::now() - Duration::from_secs(1);
     loop {
         if addons.as_ref().is_some_and(|a| {
@@ -594,13 +983,39 @@ fn session(state_dir: &Path, show_addons: bool) -> io::Result<()> {
                 }
             }
         }
+        // The graph scrolls at 10 Hz while it is on screen; it asks only while audio plays.
+        let graph = addons.is_none() && profiles.is_none() && status.spectrum;
+        if graph && last_level.elapsed() >= Duration::from_millis(100) {
+            last_level = Instant::now();
+            let levels = (status.active && !status.paused)
+                .then(|| control::request("LEVELS").ok())
+                .flatten()
+                .and_then(|reply| control::parse_levels(&reply));
+            history.push(levels.unwrap_or_default());
+            last_draw = Instant::now() - Duration::from_secs(1);
+        }
         if last_draw.elapsed() >= Duration::from_millis(250) {
             if let Some(menu) = &addons {
-                menu.draw(&status, addon_job.as_ref().map(|j| j.id), &addon_notice)?;
+                menu.draw(
+                    &mut screen,
+                    &status,
+                    addon_job.as_ref().map(|j| j.id),
+                    &addon_notice,
+                )?;
             } else if let Some(menu) = &profiles {
-                menu.draw()?;
+                menu.draw(&mut screen)?;
             } else {
-                draw(&status, &notice, prompt.as_deref())?;
+                let (width, height) = size();
+                let canvas = dashboard(
+                    &status,
+                    &notice,
+                    prompt.as_deref(),
+                    &history,
+                    &local_clock(offset),
+                    width,
+                    height,
+                );
+                show(&mut screen, &canvas)?;
             }
             last_draw = Instant::now();
         }
@@ -700,7 +1115,7 @@ fn session(state_dir: &Path, show_addons: bool) -> io::Result<()> {
                     Some(ProfileAction::Apply) => {
                         let choice = menu.entries[menu.selected].key().to_owned();
                         menu.notice = "Applying profile...".into();
-                        menu.draw()?;
+                        menu.draw(&mut screen)?;
                         if let Some(socket) = login_socket.take() {
                             let _ = socket.shutdown(std::net::Shutdown::Both);
                         }
@@ -940,22 +1355,50 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn station_time_zone_offset_is_read_without_the_location() {
+        // The station's real layout with the coordinates zeroed.
+        let mut data = vec![0x0a, 0x12, 0x09];
+        data.extend([0; 8]);
+        data.push(0x11);
+        data.extend([0; 8]);
+        data.extend(b"\x12\x12\x0a\x0dEurope/Moscow\x10\xb0\x54");
+        assert_eq!(geosync_offset(&data), Some(10800));
+        let west = b"\x12\x0b\x10\xe0\xc7\xff\xff\xff\xff\xff\xff\xff\x01";
+        assert_eq!(geosync_offset(west), Some(-7200));
+        assert_eq!(geosync_offset(b"\x12\x04\x0a\x02ab"), None);
+        assert_eq!(geosync_offset(b"\x12\x09"), None);
+        assert_eq!(geosync_offset(b"\x0b"), None);
+        assert_eq!(geosync_offset(b""), None);
+    }
+    fn rows(status: &Status, notice: &str, width: usize, height: usize) -> Vec<String> {
+        let canvas = dashboard(
+            status,
+            notice,
+            None,
+            &History::default(),
+            "12:00",
+            width,
+            height,
+        );
+        (0..height).map(|y| canvas.row(y)).collect()
+    }
+    fn has(rows: &[String], text: &str) -> bool {
+        rows.iter().any(|row| row.contains(text))
+    }
+    #[test]
     fn loading_and_failed_tracks_are_not_shown_as_playing() {
         let mut status = Status {
             connected: true,
             loading: true,
             ..Default::default()
         };
-        assert!(
-            lines(&status, "", None, 80)
-                .iter()
-                .any(|s| s.ends_with("|   LOADING"))
-        );
+        assert!(has(&rows(&status, "", 80, 24), "● LOADING"));
         status.loading = false;
         status.error = "Track unavailable".into();
-        let frame = lines(&status, "", None, 80);
-        assert!(frame.iter().any(|s| s.ends_with("|   UNAVAILABLE")));
-        assert!(frame.iter().any(|s| s == "Track unavailable"));
+        let frame = rows(&status, "", 80, 24);
+        assert!(has(&frame, "● UNAVAILABLE"));
+        assert!(has(&frame, "Track unavailable"));
+        assert!(!has(&frame, "PLAYING"));
     }
     #[test]
     fn latched_failure_is_visible_while_spotify_is_disconnected() {
@@ -965,10 +1408,10 @@ mod tests {
             error: "Audio key request failed".into(),
             ..Default::default()
         };
-        let frame = lines(&status, "", None, 90);
-        assert!(frame.iter().any(|s| s.ends_with("|   RETRY REQUIRED")));
-        assert!(frame.iter().any(|s| s == "Retry available in 12s"));
-        assert!(frame.iter().any(|s| s == "Audio key request failed"));
+        let frame = rows(&status, "", 90, 24);
+        assert!(has(&frame, "● RETRY REQUIRED"));
+        assert!(has(&frame, "Retry available in 12s"));
+        assert!(has(&frame, "Audio key request failed"));
     }
     #[test]
     fn refused_login_replaces_connecting_while_disconnected() {
@@ -977,42 +1420,138 @@ mod tests {
             error: "Saved Spotify login was rejected; pair again with spotiya login".into(),
             ..Default::default()
         };
-        let frame = lines(&status, "", None, 90);
-        assert!(frame.iter().any(|s| s.ends_with("|   LOGIN REQUIRED")));
-        assert!(frame.iter().any(|s| s.contains("pair again")));
+        let frame = rows(&status, "", 90, 24);
+        assert!(has(&frame, "● LOGIN REQUIRED"));
+        assert!(has(&frame, "pair again"));
         status.login_refused = "premium".into();
-        let frame = lines(&status, "", None, 90);
-        assert!(frame.iter().any(|s| s.ends_with("|   PREMIUM REQUIRED")));
+        assert!(has(&rows(&status, "", 90, 24), "● PREMIUM REQUIRED"));
         status.login_refused.clear();
-        let frame = lines(&status, "", None, 90);
-        assert!(frame.iter().any(|s| s.ends_with("|   CONNECTING")));
+        assert!(has(&rows(&status, "", 90, 24), "● CONNECTING"));
     }
     #[test]
     fn spectrum_state_is_visible_for_supported_and_other_devices() {
         let mut status = Status::default();
+        let frame = rows(&status, "", 80, 24);
+        assert!(has(&frame, "not available on this device"));
         assert!(
-            lines(&status, "", None, 80)
+            frame
                 .iter()
-                .any(|s| s == "Spectrum: unavailable")
+                .any(|r| r.contains("spectrum") && r.contains("○ n/a"))
         );
         status.spectrum_supported = true;
-        for (enabled, label) in [(false, "off"), (true, "on")] {
-            status.spectrum = enabled;
-            let frame = lines(&status, "", None, 80);
-            assert!(frame.iter().any(|s| s == &format!("Spectrum: {label}")));
-            assert!(frame.iter().any(|s| s.contains("e spectrum on/off")));
+        let frame = rows(&status, "", 80, 24);
+        assert!(has(&frame, "press e to turn it on"));
+        assert!(
+            frame
+                .iter()
+                .any(|r| r.contains("spectrum") && r.contains("○ off"))
+        );
+        status.spectrum = true;
+        let frame = rows(&status, "", 80, 24);
+        assert!(!has(&frame, "press e"));
+        assert!(
+            frame
+                .iter()
+                .any(|r| r.contains("spectrum") && r.contains("● on"))
+        );
+        assert!(has(&frame, "e spectrum"));
+        assert!(has(&frame, "bass") && has(&frame, "treble"));
+    }
+    #[test]
+    fn the_graph_scrolls_with_new_levels_and_groups_bands_on_short_screens() {
+        let status = Status {
+            spectrum_supported: true,
+            spectrum: true,
+            ..Default::default()
+        };
+        let mut history = History::default();
+        for _ in 0..HISTORY + 10 {
+            history.push([100, 0, 0, 0]);
         }
+        assert_eq!(history.0.len(), HISTORY);
+        let canvas = dashboard(&status, "", None, &history, "", 80, 24);
+        let full: Vec<String> = (0..24).map(|y| canvas.row(y)).collect();
+        assert!(has(&full, "⣿⣿⣿"));
+        assert!(has(&full, "100%"));
+        // A very wide window still fills from the left edge once enough audio has played.
+        let width = 1000;
+        let canvas = dashboard(&status, "", None, &history, "", width, 40);
+        let graph = (0..40)
+            .map(|y| canvas.row(y))
+            .find(|r| r.contains('⣿'))
+            .unwrap();
+        assert_eq!(graph.matches('⣿').count(), width - 4 - 9);
+        // Short terminals merge the four bands into low and high.
+        let canvas = dashboard(&status, "", None, &history, "", 80, 15);
+        let short: Vec<String> = (0..15).map(|y| canvas.row(y)).collect();
+        assert!(has(&short, "low") && has(&short, "high") && !has(&short, "bass"));
+    }
+    #[test]
+    fn layouts_fit_narrow_and_tiny_terminals() {
+        let status = Status {
+            title: "No Surprises".into(),
+            artist: "Radiohead".into(),
+            volume: 80,
+            ..Default::default()
+        };
+        for (width, height) in [(50, 30), (72, 20), (120, 40)] {
+            let frame = rows(&status, "", width, height);
+            assert!(frame.iter().all(|r| screen::text_width(r) == width));
+            assert!(has(&frame, "No Surprises") && has(&frame, "Radiohead"));
+            assert!(has(&frame, " 80%"));
+        }
+        let tiny = rows(&status, "Code: ABC", 30, 6);
+        assert!(has(&tiny, "Enlarge the terminal") && has(&tiny, "Code: ABC"));
+    }
+    #[test]
+    fn long_names_and_pairing_messages_wrap_instead_of_being_cut() {
+        let status = Status {
+            title: "Bohemian Rhapsody - Remastered 2011 Version With A Very Long Subtitle".into(),
+            artist: "Queen".into(),
+            album: "A Night at the Opera (Deluxe Remastered Version)".into(),
+            ..Default::default()
+        };
+        let url = "https://accounts.spotify.com/pair?code=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let notice = format!("Open {url}\nCode: QX7-42\nWaiting for approval... (Ctrl+C cancels)");
+        let frame = rows(&status, &notice, 80, 30);
+        // The now playing panel is the left 44 columns; wrapped lines rejoin with a space.
+        let text = frame
+            .iter()
+            .map(|r| {
+                r.chars()
+                    .take(42)
+                    .skip(2)
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("Bohemian Rhapsody") && text.contains("Subtitle"));
+        assert!(text.contains("(Deluxe Remastered Version)"));
+        // The URL has no spaces, so it splits between characters.
+        assert!(text.replace(' ', "").contains(url));
+        assert!(text.contains("Code: QX7-42") && text.contains("(Ctrl+C cancels)"));
+        // The progress bar and spectrum panel still fit below the taller panel.
+        assert!(has(&frame, "0:00") && has(&frame, "spectrum"));
     }
     #[test]
     fn metadata_cannot_inject_terminal_controls_and_empty_progress_is_safe() {
         assert_eq!(safe("Song\x1b[2J\r\n"), "Song[2J");
         let mut s = Status {
             title: "\x1b[31mTitle".into(),
+            artist: "\x07bell\x1b]0;owned\x07".into(),
             ..Default::default()
         };
-        assert!(lines(&s, "", None, 20).iter().all(|s| !s.contains('\x1b')));
+        let canvas = dashboard(&s, "notice\x1b[2J", None, &History::default(), "", 80, 24);
+        let frame = Screen::new(screen::Colors::True).frame(&canvas);
+        assert!(
+            !frame.contains("\x1b[31m") && !frame.contains("\x1b]0") && !frame.contains('\x07')
+        );
+        assert!(!frame.contains("\x1b[2J\x1b") || frame.starts_with("\x1b[0m\x1b[2J"));
         s.duration_ms = 100;
         s.position_ms = 999;
-        let _ = lines(&s, "", None, 20);
+        let _ = rows(&s, "", 20, 5);
+        let _ = rows(&s, "", 80, 24);
     }
 }

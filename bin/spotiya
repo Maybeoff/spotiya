@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import termios
+import time
 import tty
 
 BASE = "/data/opt/spotify-connect"
@@ -111,7 +112,12 @@ def main():
     remote = shlex.join([BASE + "/spotiya", "--" + remote_command] + value)
     if interactive:
         columns, rows = shutil.get_terminal_size(fallback=(80, 24))
-        remote = f"stty rows {rows} cols {columns}; exec " + remote
+        # adb does not forward the environment; truecolor support decides the TUI palette.
+        colors = os.environ.get("COLORTERM", "")
+        prefix = f"export COLORTERM={shlex.quote(colors)}; " if colors in ("truecolor", "24bit") else ""
+        # The station clock runs in UTC; the TUI header shows the time here.
+        prefix += f"export SPOTIYA_UTC_OFFSET={time.localtime().tm_gmtoff}; "
+        remote = f"{prefix}stty rows {rows} cols {columns}; exec " + remote
     flags = ["-t"] if interactive else []
     if interactive:
         saved = termios.tcgetattr(sys.stdin)
