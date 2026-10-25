@@ -661,7 +661,7 @@ async fn stop_connection(
     session.shutdown();
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
     unsafe extern "C" {
         fn spotiya_native_stderr();
     }
@@ -680,6 +680,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::env::set_var("TOKIO_WORKER_THREADS", "1");
         }
     }
+    // Returning the error from main would print its Debug form, such as `Custom { kind: .. }`.
+    match start() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+fn start() -> Result<(), Box<dyn std::error::Error>> {
     let Some(options) = options().map_err(io::Error::other)? else {
         return Ok(());
     };
