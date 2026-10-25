@@ -242,15 +242,33 @@ fn source(root: &Path, binary: &Path, file: &str) -> PathBuf {
         root.join("packaging").join(file)
     }
 }
+fn sequence(name: &str) -> Option<u128> {
+    name.strip_prefix("managed-")?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
+}
+/// The station has no battery clock, so wall time can jump back across a reboot before
+/// NTP syncs. Backups are numbered past every existing one so the newest never sorts first.
+fn next_sequence(parent: &Path) -> io::Result<u128> {
+    let mut next = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for entry in fs::read_dir(parent)? {
+        if let Some(existing) = entry?.file_name().to_str().and_then(sequence) {
+            next = next.max(existing + 1);
+        }
+    }
+    Ok(next)
+}
 fn snapshot(layout: &Layout) -> io::Result<PathBuf> {
     let parent = layout.base.join("backups");
     fs::create_dir_all(&parent)?;
     let path = parent.join(format!(
         "managed-{:020}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
+        next_sequence(&parent)?,
         uuid::Uuid::new_v4()
     ));
     fs::create_dir(&path)?;
@@ -330,13 +348,15 @@ fn prune(base: &Path, keep: usize) -> io::Result<()> {
         let manifest = fs::read(item.path().join("manifest.json"))
             .ok()
             .and_then(|b| serde_json::from_slice::<Manifest>(&b).ok());
-        if manifest.is_some_and(|m| m.version == 1) {
-            backups.push(item.path());
+        if manifest.is_some_and(|m| m.version == 1)
+            && let Some(order) = item.file_name().to_str().and_then(sequence)
+        {
+            backups.push((order, item.path()));
         }
     }
     backups.sort();
     let remove = backups.len().saturating_sub(keep);
-    for path in backups.into_iter().take(remove) {
+    for (_, path) in backups.into_iter().take(remove) {
         fs::remove_dir_all(path)?;
     }
     Ok(())
@@ -388,8 +408,17 @@ fn transaction(
     }
     let backup = snapshot(layout)?;
     let had_service = layout.init.exists();
-    if running && had_service {
-        service.stop()?;
+    if running
+        && had_service
+        && let Err(e) = service.stop()
+    {
+        // Nothing was replaced yet; bring back whatever part of the service did stop.
+        return Err(error(match service.start() {
+            Ok(()) => format!("Installation aborted: {e}"),
+            Err(start) => {
+                format!("Installation aborted: {e}; receiver restart also failed: {start}")
+            }
+        }));
     }
     let result: io::Result<()> = (|| {
         for &file in FILES {
@@ -412,17 +441,24 @@ fn transaction(
         Ok(())
     })();
     if let Err(cause) = result {
-        let _ = service.stop();
+        // A receiver that did not stop is still the new build; starting would only find it
+        // running and report it ready, so the restored files wait for the next start.
+        let stopped = service.stop();
         let restored = restore(layout, &backup);
         // Start the receiver even after a partial restore; whatever is on disk beats nothing.
-        let started = if running && had_service {
-            service.start().and_then(|()| service.ready(profile))
-        } else {
-            Ok(())
+        let started = match &stopped {
+            Err(e) if running => Err(error(format!("receiver did not stop: {e}"))),
+            _ if running && had_service => service.start().and_then(|()| service.ready(profile)),
+            _ => Ok(()),
         };
-        let rollback = match restored.and(started) {
-            Ok(()) => "succeeded".into(),
-            Err(e) => format!("needs attention ({e})"),
+        let problems: Vec<String> = [restored, started]
+            .into_iter()
+            .filter_map(|r| r.err().map(|e| e.to_string()))
+            .collect();
+        let rollback = if problems.is_empty() {
+            "succeeded".into()
+        } else {
+            format!("needs attention ({})", problems.join("; "))
         };
         return Err(error(format!(
             "Installation failed: {cause}. Rollback {rollback}. Backup: {}",
@@ -509,18 +545,35 @@ mod tests {
     struct Fake {
         calls: Vec<&'static str>,
         fail: bool,
+        /// Index of the stop call that fails.
+        failing_stop: Option<usize>,
+        failing_start: bool,
+        /// Backups directory whose binaries vanish when ready() runs, breaking the restore.
+        sabotage: Option<PathBuf>,
     }
     impl Service for Fake {
         fn stop(&mut self) -> io::Result<()> {
+            let index = self.calls.iter().filter(|c| **c == "stop").count();
             self.calls.push("stop");
+            if self.failing_stop == Some(index) {
+                return Err(error("fixture stop timed out"));
+            }
             Ok(())
         }
         fn start(&mut self) -> io::Result<()> {
             self.calls.push("start");
+            if self.failing_start {
+                return Err(error("fixture start failed"));
+            }
             Ok(())
         }
         fn ready(&mut self, _: &str) -> io::Result<()> {
             self.calls.push("ready");
+            if let Some(backups) = self.sabotage.take() {
+                for entry in fs::read_dir(backups).unwrap() {
+                    let _ = fs::remove_file(entry.unwrap().path().join("spotiya"));
+                }
+            }
             if self.fail {
                 self.fail = false;
                 Err(error("fixture startup failed"))
@@ -561,6 +614,9 @@ mod tests {
         let mut svc = Fake {
             calls: vec![],
             fail: true,
+            failing_stop: None,
+            failing_start: false,
+            sabotage: None,
         };
         assert!(
             transaction(
@@ -586,6 +642,115 @@ mod tests {
             fs::read(layout.base.join("receiver-state/credentials.json")).unwrap(),
             b"private fixture"
         );
+    }
+    #[test]
+    fn receiver_that_does_not_stop_is_not_reported_as_rolled_back() {
+        let (_temp, layout, root) = fixture();
+        let mut svc = Fake {
+            calls: vec![],
+            fail: true,
+            failing_stop: Some(1),
+            failing_start: false,
+            sabotage: None,
+        };
+        let message = transaction(
+            &layout,
+            &root,
+            &root.join("spotiya"),
+            true,
+            "mini2",
+            &mut svc,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("Rollback needs attention (receiver did not stop"),
+            "{message}"
+        );
+        assert_eq!(svc.calls, ["stop", "start", "ready", "stop"]);
+        for &f in FILES {
+            assert_eq!(fs::read(layout.destination(f)).unwrap(), b"old");
+        }
+        let mut svc = Fake {
+            calls: vec![],
+            fail: true,
+            failing_stop: Some(1),
+            failing_start: false,
+            sabotage: Some(layout.base.join("backups")),
+        };
+        let message = transaction(
+            &layout,
+            &root,
+            &root.join("spotiya"),
+            true,
+            "mini2",
+            &mut svc,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("Could not restore spotiya"), "{message}");
+        assert!(message.contains("receiver did not stop"), "{message}");
+    }
+    #[test]
+    fn failed_first_stop_changes_nothing_and_restarts_the_service() {
+        let (_temp, layout, root) = fixture();
+        let mut svc = Fake {
+            calls: vec![],
+            fail: false,
+            failing_stop: Some(0),
+            failing_start: false,
+            sabotage: None,
+        };
+        let install = |svc: &mut Fake| {
+            transaction(&layout, &root, &root.join("spotiya"), true, "mini2", svc)
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            install(&mut svc),
+            "Installation aborted: fixture stop timed out"
+        );
+        assert_eq!(svc.calls, ["stop", "start"]);
+        let mut svc = Fake {
+            calls: vec![],
+            fail: false,
+            failing_stop: Some(0),
+            failing_start: true,
+            sabotage: None,
+        };
+        assert!(install(&mut svc).ends_with("receiver restart also failed: fixture start failed"));
+        for &f in FILES {
+            assert_eq!(fs::read(layout.destination(f)).unwrap(), b"old");
+        }
+    }
+    #[test]
+    fn newest_backup_survives_a_clock_that_went_backwards() {
+        let (_temp, layout, root) = fixture();
+        let mut svc = Fake {
+            calls: vec![],
+            fail: false,
+            failing_stop: None,
+            failing_start: false,
+            sabotage: None,
+        };
+        // Made while the clock was far ahead of the current time.
+        let future = layout
+            .base
+            .join("backups/managed-90000000000000000000-future");
+        fs::create_dir_all(&future).unwrap();
+        fs::write(
+            future.join("manifest.json"),
+            br#"{"version":1,"files":[],"cli_existed":true}"#,
+        )
+        .unwrap();
+        let install = |svc: &mut Fake| {
+            transaction(&layout, &root, &root.join("spotiya"), false, "mini2", svc).unwrap()
+        };
+        let first = install(&mut svc);
+        let second = install(&mut svc);
+        assert!(first.exists() && second.exists());
+        assert!(!future.exists());
+        assert!(second > first);
     }
     #[test]
     fn restore_continues_past_a_file_it_cannot_write() {
@@ -622,6 +787,9 @@ mod tests {
         let mut service = Fake {
             calls: vec![],
             fail: false,
+            failing_stop: None,
+            failing_start: false,
+            sabotage: None,
         };
         transaction(
             &layout,
@@ -649,6 +817,9 @@ mod tests {
         let mut svc = Fake {
             calls: vec![],
             fail: false,
+            failing_stop: None,
+            failing_start: false,
+            sabotage: None,
         };
         fs::create_dir_all(layout.base.join("backups/manual")).unwrap();
         for _ in 0..4 {
