@@ -50,13 +50,13 @@ jobs:
       - run: python3 -m unittest discover -s tests -p 'test_*.py'
 
   arm:
-    name: ARMv7 / glibc 2.30
+    name: ARMv7 / glibc 2.23
     runs-on: ubuntu-24.04
     needs: checks
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config curl bzip2
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config curl bzip2 xz-utils
       - run: rustup toolchain install 1.98.0 --profile minimal --target armv7-unknown-linux-gnueabihf
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:

@@ -6,7 +6,8 @@ Spotify Connect для Яндекс Станций: музыка, голосов
 бинарнике на Rust. Воспроизведение и подключение к Spotify обеспечивает
 [librespot](https://github.com/librespot-org/librespot/tree/v0.8.0).
 
-Проект проверен на **Станции Мини 2** с Buildroot, glibc 2.30 и 32-битным ARM
+Проект поддерживает **первую Мини (YNDX-0004, `yandexmini`)** с glibc 2.23
+и **Мини 2** с glibc 2.30. Обе используют Buildroot и 32-битный ARM
 userspace. Имя в Spotify берётся из hostname колонки. Для других моделей нужны
 совместимая сборка, ALSA и проверка локального протокола Алисы; поддержка всех
 моделей не заявляется.
@@ -59,11 +60,19 @@ adb -s SPEAKER_IP:5555 shell sh /tmp/spotiya/scripts/install.sh
 конфигурацию и обнаруженные возможности. Эти команды доступны без запуска
 приёмника; профиль работающего приёмника также виден в TUI.
 
+- `mini1` — первая Мини: штатная ALSA, общая громкость `Master` и Quasar IPC.
+  Допустим также выбор по имени `yandexmini`.
 - `mini2` — проверенный профиль Мини 2 с Quasar IPC и драйвером её кнопок,
   шестисегментного RGB-кольца и четырёхразрядного дисплея.
 - `generic` — Spotify Connect через ALSA без штатного IPC и физического управления.
 - `auto` — использует `receiver-state/profile.json`, если файл существует;
-  иначе определяет Мини 2 по device tree и выбирает `generic` для остальных устройств.
+  иначе использует `common.deviceType` из системного `quasar.cfg` и device tree.
+  `yandexmini` выбирает `mini1`, `yandexmini_2` — `mini2`; неизвестные модели получают `generic`.
+
+У первой Мини отдельный драйвер датчика жестов и подсветки пока не включён.
+Кнопка микрофона и штатные жесты остаются у Алисы; изменение общего `Master`
+подхватывается приёмником. Экрана у этой модели нет. Фирменная ALSA-библиотека
+реализует виртуальный `default`, поэтому профиль не подменяет его прямым `hw`.
 
 Кнопки, кольцо и дисплей проверяются независимо. Для кольца и дисплея должны
 существовать все нужные sysfs-каналы; для кнопок Мини 2 проверяется имя input-устройства.
@@ -71,7 +80,7 @@ adb -s SPEAKER_IP:5555 shell sh /tmp/spotiya/scripts/install.sh
 показывается как `unavailable`; команды паузы штатному плееру не отправляются.
 
 В TUI нажми `d`, выбери профиль стрелками или `j`/`k` и подтверди Enter.
-Из терминала: `spotiya profile select mini2`, `spotiya profile select generic`
+Из терминала: `spotiya profile select mini1`, `spotiya profile select mini2`, `spotiya profile select generic`
 или `spotiya profile select auto`. Выбор сохраняется при обновлениях и перезагрузках.
 Работающий приёмник перезапускается; воспроизведение при этом прекращается.
 Остановленный приёмник остаётся остановленным. При неудачном запуске возвращается
@@ -387,7 +396,7 @@ RSS включает страницы бинарника и библиотек, 
 
 ## Сборка
 
-На Linux с x86_64 нужны Rust/rustup, C-компилятор, make, pkg-config, curl и bzip2.
+На Linux с x86_64 нужны Rust/rustup, C-компилятор, make, pkg-config, curl, bzip2 и xz.
 Для локальных Rust-тестов нужны заголовки ALSA (`libasound2-dev` в Debian/Ubuntu).
 
 ```sh
@@ -401,7 +410,8 @@ scripts/build-arm.sh
 scripts/package.sh
 ```
 
-ARM-сборка использует Bootlin GCC 8.4 / glibc 2.30 и ALSA 1.1.8. Загрузки
+ARM-сборка использует Linaro GCC 6.5 / glibc 2.23 и ALSA 1.1.8.
+`scripts/build-arm.sh` проверяет, что бинарник не требует более новой glibc. Загрузки
 проверяются по SHA-256; Rust и зависимости зафиксированы в `rust-toolchain.toml`
 и `Cargo.lock`. На колонке используются её системные `libasound.so.2` и glibc;
 ALSA из сборочного sysroot в пакет не включается.
