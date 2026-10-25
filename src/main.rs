@@ -520,7 +520,14 @@ fn resolved_profile(options: &Options) -> io::Result<profiles::Resolved> {
     }
     Ok(resolved)
 }
-fn file_lock(dir: &Path, name: &str) -> io::Result<File> {
+/// Unlocks explicitly on drop: a child forked by another thread may still share the descriptor.
+struct FileLock(File);
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+fn file_lock(dir: &Path, name: &str) -> io::Result<FileLock> {
     fs::create_dir_all(dir)?;
     let file = OpenOptions::new()
         .create(true)
@@ -531,7 +538,7 @@ fn file_lock(dir: &Path, name: &str) -> io::Result<File> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(file)
+    Ok(FileLock(file))
 }
 fn publish_status(
     s: &Shared,

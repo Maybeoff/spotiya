@@ -135,6 +135,7 @@ fn allowed(addon: &Addon, path: &Path) -> bool {
     let Some(p) = path.to_str() else {
         return false;
     };
+    // Packages up to 0.9.3 carried a manual installer; it stays in the stage and is never installed.
     if p == "install.sh" {
         return true;
     }
@@ -707,7 +708,7 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().path())
             .find(|p| p.to_string_lossy().contains(".airplay-previous-"))
-            .unwrap();
+            .expect(&message);
         assert!(message.contains(&*kept.to_string_lossy()), "{message}");
         assert_eq!(fs::read(kept.join("bin/nqptp")).unwrap(), b"older binary");
         assert!(!dir.0.join("airplay").exists());

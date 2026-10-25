@@ -53,7 +53,6 @@ with tempfile.TemporaryDirectory(prefix="airplay-package-",dir=DIST) as scratch:
                 destination = payload/"licenses"/name
                 destination.mkdir(parents=True,exist_ok=True)
                 shutil.copy2(source,destination/source.name)
-    shutil.copy2(PROJECT/"scripts/install-airplay.sh",root/"install.sh")
     archive = DIST/"spotiya-airplay2-armv7.tar.gz"
     with tarfile.open(archive,"w:gz",compresslevel=9) as tar:
         tar.add(root,arcname=root.name)

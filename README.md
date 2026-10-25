@@ -563,13 +563,12 @@ gettext, pkg-config, flex, bison, xxd и host-программа `plistutil`.
 Исходники зависимостей закреплены в `airplay/sources.json` с SHA256;
 ревизии Shairport Sync и NQPTP закреплены в `airplay/fetch.py`.
 
-Сначала установите Spotiya 0.9.1 или новее. Затем распакуйте AirPlay-архив **на ПК**,
-скопируйте каталог `spotiya-airplay2` на станцию и запустите установщик:
+Собранный пакет ставится той же командой, что и пакет из релиза; версия Spotiya
+на станции должна совпадать с версией пакета:
 
 ```sh
-tar -xzf spotiya-airplay2-armv7.tar.gz
-adb -s DEVICE push spotiya-airplay2 /tmp/spotiya-airplay2-install
-adb -s DEVICE shell sh /tmp/spotiya-airplay2-install/install.sh
+adb -s DEVICE push dist/spotiya-airplay2-armv7.tar.gz dist/AIRPLAY_SHA256SUMS /tmp/
+adb -s DEVICE shell spotiya addon file airplay /tmp/spotiya-airplay2-armv7.tar.gz /tmp/AIRPLAY_SHA256SUMS
 adb -s DEVICE shell spotiya airplay on
 ```
 

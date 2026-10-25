@@ -90,13 +90,24 @@ mod tests {
             } else {
                 "exit 1\n"
             };
+            // Copy in a child so no writable descriptor of the helper can leak into a
+            // concurrent test's fork, which would make exec fail with ETXTBSY.
+            let source = helper.with_extension("source");
             fs::write(
-                &helper,
+                &source,
                 format!(
                     "#!/bin/sh\ndd bs=5 count=1 of=/dev/null 2>/dev/null\nprintf x >> \"$0.count\"\n{response}"
                 ),
             )
             .unwrap();
+            assert!(
+                std::process::Command::new("cp")
+                    .arg(&source)
+                    .arg(&helper)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
             fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
         }
         fn helper(&self) -> PathBuf {
