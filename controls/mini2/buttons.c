@@ -186,9 +186,11 @@ int mini2_buttons_run(const struct mini2_config *config) {
                 display_show(&display, current_steps > 0 ? current_volume * 100 / current_steps : 0,
                              now_us(CLOCK_MONOTONIC));
             if (!wanted) {
+                /* A track change reports Spotify inactive while it loads; gesture
+                 * feedback still plays to its end below. */
                 queued = 0;
-                lights_close(&lights, 1);
-                display_close(&display);
+                if (display.mode != DISPLAY_ANIMATION)
+                    display_close(&display);
             }
         }
         ssize_t n = 0;
@@ -256,14 +258,20 @@ int mini2_buttons_run(const struct mini2_config *config) {
                 wanted = spotify_active();
                 int64_t now = now_us(CLOCK_MONOTONIC);
                 probe_at = now + 300000;
-                if (wanted) {
-                    lights_begin(&lights, queue[i], feedback_paused, current_volume, current_steps,
+                /* The command succeeded, so show its feedback even if the next track is
+                 * already loading and Spotify briefly reports itself inactive. */
+                lights_begin(&lights, queue[i], feedback_paused, current_volume, current_steps,
+                             now);
+                if (queue[i] == LOUDER || queue[i] == QUIETER)
+                    display_show(&display,
+                                 current_steps > 0 ? current_volume * 100 / current_steps : 0, now);
+                else
+                    display_play(&display,
+                                 queue[i] == NEXT   ? &control_config.clock_next
+                                 : queue[i] == PREV ? &control_config.clock_previous
+                                 : feedback_paused  ? &control_config.clock_pause
+                                                    : NULL,
                                  now);
-                    if (queue[i] == LOUDER || queue[i] == QUIETER)
-                        display_show(&display,
-                                     current_steps > 0 ? current_volume * 100 / current_steps : 0,
-                                     now);
-                }
             } else {
                 note(" failed; returning controls\n");
                 wanted = 0;
@@ -293,8 +301,15 @@ int mini2_buttons_run(const struct mini2_config *config) {
                     earliest(&wake, gesture - now_us(event_clock) + now);
             }
         } else {
-            lights_close(&lights, 1);
-            display_close(&display);
+            lights_tick(&lights, now);
+            if (lights.active)
+                earliest(&wake, lights.next_frame);
+            if (display.mode == DISPLAY_ANIMATION) {
+                display_tick(&display, now);
+                if (display.active)
+                    earliest(&wake, display.check_at);
+            } else
+                display_close(&display);
         }
         /* Sleep until the next deadline instead of waking every 10 ms while idle. */
         int64_t wait = wake - now_us(CLOCK_MONOTONIC);

@@ -104,6 +104,60 @@ int main(void) {
     lights_tick(&l, 2060000);
     assert(brightness(0) == 80 && brightness(6) == 26);
     lights_close(&l, 1);
+    /* Stock animations play frame by frame, then leave the ring dark. */
+    static const struct ring_frame sweep[] = {
+        {{[0] = 200, [6] = 10}, 20},
+        {{[1] = 150, [13] = 90}, 30},
+    };
+    static const struct ring_frame pause_frames[] = {{{[5] = 77}, 40}};
+    control_config.next = (struct ring_animation){sweep, 2};
+    control_config.pause = (struct ring_animation){pause_frames, 1};
+    lights_begin(&l, NEXT, 0, 50, 100, 2500000);
+    lights_tick(&l, 2500000);
+    assert(brightness(0) == 200 && brightness(6) == 10 && brightness(1) == 0);
+    assert(l.next_frame == 2520000);
+    lights_tick(&l, 2520000);
+    assert(brightness(0) == 0 && brightness(1) == 150 && brightness(13) == 90);
+    assert(l.next_frame == 2550000);
+    lights_tick(&l, 2550000);
+    assert(!l.active);
+    for (int i = 0; i < 18; i++)
+        assert(brightness(i) == 0);
+    lights_begin(&l, TOGGLE, 1, 50, 100, 2600000);
+    lights_tick(&l, 2600000);
+    assert(brightness(5) == 77 && brightness(0) == 0);
+    lights_close(&l, 1);
+    /* Without a stock animation for resume, the built-in effect still runs. */
+    lights_begin(&l, TOGGLE, 0, 50, 100, 2700000);
+    lights_tick(&l, 2760000);
+    assert(brightness(6) == 80);
+    lights_close(&l, 1);
+    control_config.next = control_config.pause = (struct ring_animation){0, 0};
+    /* Volume uses Alice's level colours: held, then faded out, the whole ring at once. */
+    static const struct ring_frame levels_palette[] = {
+        {{[0] = 10, [1] = 10, [2] = 10, [3] = 10, [4] = 10, [5] = 10}, 1000},
+        {{[6] = 200, [7] = 200, [8] = 200, [9] = 200, [10] = 200, [11] = 200}, 1000},
+        {{[12] = 90, [13] = 90, [14] = 90, [15] = 90, [16] = 90, [17] = 90}, 1000},
+    };
+    control_config.volume = (struct ring_animation){levels_palette, 3};
+    lights_begin(&l, LOUDER, 0, 50, 100, 8000000);
+    lights_tick(&l, 8000000);
+    assert(brightness(6) == 200 && brightness(11) == 200 && brightness(0) == 0);
+    assert(l.next_frame == 8550000);
+    lights_tick(&l, 8550000 + 210000);
+    assert(brightness(6) == 100 && brightness(11) == 100);
+    lights_begin(&l, QUIETER, 0, 100, 100, 8800000); /* a new press restarts the hold */
+    lights_tick(&l, 8800000);
+    assert(brightness(12) == 90 && brightness(6) == 0);
+    lights_tick(&l, 8800000 + 970000);
+    assert(!l.active);
+    for (int i = 0; i < 18; i++)
+        assert(brightness(i) == 0);
+    lights_begin(&l, QUIETER, 0, 0, 100, 10000000);
+    lights_tick(&l, 10000000);
+    assert(brightness(0) == 10 && brightness(6) == 0);
+    lights_close(&l, 1);
+    control_config.volume = (struct ring_animation){0, 0};
     control_config.ring_prefix = NULL;
     assert(!lights_open(&l));
     control_config.ring_prefix = test_ring_prefix;
@@ -216,6 +270,26 @@ int main(void) {
     clock_frame(next_clock);
     display_spectrum(&display, levels, 1, 17000000);
     assert(!display.active && clock_value(33) == 22);
+    /* Stock clock animations play over the time at its brightness, then restore it. */
+    next_clock[33] = 0;
+    clock_frame(next_clock);
+    static const struct display_frame swipe[] = {{{[3] = 255}, 20}, {{[30] = 128}, 40}};
+    static const struct display_animation swipe_animation = {swipe, 2};
+    display_play(&display, &swipe_animation, 20000000);
+    assert(display.active && display.mode == DISPLAY_ANIMATION);
+    display_tick(&display, 20000000);
+    assert(clock_value(3) == 22 && clock_value(0) == 0 && clock_value(7) == 0);
+    assert(display.check_at == 20020000);
+    display_spectrum(&display, levels, 1, 20010000);
+    assert(clock_value(3) == 22); /* the spectrum waits for the animation */
+    display_tick(&display, 20020000);
+    assert(clock_value(3) == 0 && clock_value(30) == 11);
+    display_tick(&display, 20060000);
+    assert(!display.active);
+    for (int i = 0; i < DISPLAY_LEDS; i++)
+        assert(clock_value(i) == next_clock[i]);
+    display_play(&display, NULL, 21000000);
+    assert(!display.active);
     for (int i = 0; i < DISPLAY_LEDS; i++) {
         char path[256];
         clock_path(path, sizeof path, i);

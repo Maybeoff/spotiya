@@ -3,9 +3,11 @@
 #define DISPLAY_PREFIX control_config.display_prefix
 #endif
 enum { DISPLAY_LEDS = 34 };
-enum { DISPLAY_VOLUME = 1, DISPLAY_SPECTRUM = 2 };
+enum { DISPLAY_VOLUME = 1, DISPLAY_SPECTRUM = 2, DISPLAY_ANIMATION = 3 };
 struct display {
     int fd[DISPLAY_LEDS], active, brightness, mode;
+    const struct display_animation *animation;
+    int64_t started;
     unsigned char saved[DISPLAY_LEDS], last[DISPLAY_LEDS];
     int64_t until, check_at, next_frame, yield_until;
 };
@@ -164,9 +166,55 @@ static void display_show(struct display *d, int percent, int64_t now) {
     d->until = now + 2000000;
     d->check_at = now + 50000;
 }
+/* Plays one of Alice's clock animations over the time, then puts the clock back. */
+static void display_play(struct display *d, const struct display_animation *animation,
+                         int64_t now) {
+    if (!animation || !animation->count)
+        return;
+    if (d->active && !display_unchanged(d)) {
+        display_yield(d, now);
+        return;
+    }
+    if (now < d->yield_until)
+        return;
+    if (!d->active && !display_open(d))
+        return;
+    d->mode = DISPLAY_ANIMATION;
+    d->animation = animation;
+    d->started = now;
+    d->check_at = now;
+}
+static void display_animate(struct display *d, int64_t now) {
+    int elapsed = (int)((now - d->started) / 1000), end = 0;
+    const struct display_frame *frame = NULL;
+    for (unsigned i = 0; i < d->animation->count; i++) {
+        end += d->animation->frames[i].ms;
+        if (elapsed < end) {
+            frame = &d->animation->frames[i];
+            break;
+        }
+    }
+    if (!frame) {
+        display_close(d);
+        return;
+    }
+    unsigned char scaled[DISPLAY_LEDS];
+    for (int i = 0; i < DISPLAY_LEDS; i++)
+        scaled[i] = (unsigned char)(frame->level[i] * d->brightness / 255);
+    if (!display_frame(d, scaled))
+        return;
+    d->check_at = d->started + (int64_t)end * 1000;
+}
 static void display_tick(struct display *d, int64_t now) {
     if (!d->active || now < d->check_at)
         return;
+    if (d->mode == DISPLAY_ANIMATION) {
+        if (!display_unchanged(d))
+            display_yield(d, now);
+        else
+            display_animate(d, now);
+        return;
+    }
     if (!display_unchanged(d)) {
         display_yield(d, now);
         return;
@@ -191,7 +239,7 @@ static void display_spectrum(struct display *d, const unsigned char *levels, int
             display_close(d);
         return;
     }
-    if (now < d->yield_until || (d->active && d->mode == DISPLAY_VOLUME) ||
+    if (now < d->yield_until || (d->active && d->mode != DISPLAY_SPECTRUM) ||
         (d->active && now < d->next_frame))
         return;
     if (!d->active) {

@@ -34,6 +34,7 @@ use tokio::{
 };
 mod addons;
 mod airplay;
+mod animations;
 mod audio_guard;
 mod auth;
 mod control;

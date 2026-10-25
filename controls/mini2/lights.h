@@ -4,6 +4,7 @@
 #endif
 struct lights {
     int fd[18], active, scene, paused, volume, steps;
+    const struct ring_animation *animation;
     unsigned char last[18];
     int64_t started, next_frame, yield_until;
 };
@@ -94,6 +95,13 @@ static void lights_begin(struct lights *l, enum action a, int paused, int volume
         return;
     l->scene = a;
     l->paused = paused;
+    /* Prefer Alice's own animation for the gesture; volume keeps the level meter below. */
+    const struct ring_animation *stock =
+        a == NEXT     ? &control_config.next
+        : a == PREV   ? &control_config.previous
+        : a == TOGGLE ? (paused ? &control_config.pause : &control_config.resume)
+                      : NULL;
+    l->animation = stock && stock->count ? stock : NULL;
     l->volume = volume;
     l->steps = steps;
     l->started = now;
@@ -108,6 +116,56 @@ static void lights_tick(struct lights *l, int64_t now) {
         return;
     }
     int elapsed = (int)((now - l->started) / 1000);
+    const struct ring_animation *palette = &control_config.volume;
+    if ((l->scene == LOUDER || l->scene == QUIETER) && palette->count && l->steps > 0) {
+        /* As Quasar shows volume: the whole ring in the level's colour, held 550 ms after
+         * the last press, then faded out over 420 ms. */
+        enum { HOLD_MS = 550, FADE_MS = 420 };
+        if (elapsed >= HOLD_MS + FADE_MS) {
+            lights_close(l, 1);
+            return;
+        }
+        int volume = l->volume < 0 ? 0 : l->volume > l->steps ? l->steps : l->volume;
+        unsigned index = (unsigned)((volume * (int)(palette->count - 1) + l->steps / 2) / l->steps);
+        int left = elapsed < HOLD_MS ? FADE_MS : HOLD_MS + FADE_MS - elapsed;
+        for (int i = 0; i < 18; i++) {
+            int value = palette->frames[index].level[i] * left / FADE_MS;
+            if (value != l->last[i]) {
+                if (!ring_write(l->fd[i], value)) {
+                    lights_close(l, 1);
+                    return;
+                }
+                l->last[i] = (unsigned char)value;
+            }
+        }
+        l->next_frame = elapsed < HOLD_MS ? l->started + HOLD_MS * 1000 : now + 20000;
+        return;
+    }
+    if (l->animation) {
+        int end = 0;
+        const struct ring_frame *frame = NULL;
+        for (unsigned i = 0; i < l->animation->count; i++) {
+            end += l->animation->frames[i].ms;
+            if (elapsed < end) {
+                frame = &l->animation->frames[i];
+                break;
+            }
+        }
+        if (!frame) {
+            lights_close(l, 1);
+            return;
+        }
+        for (int i = 0; i < 18; i++)
+            if (frame->level[i] != l->last[i]) {
+                if (!ring_write(l->fd[i], frame->level[i])) {
+                    lights_close(l, 1);
+                    return;
+                }
+                l->last[i] = frame->level[i];
+            }
+        l->next_frame = l->started + (int64_t)end * 1000;
+        return;
+    }
     int duration = (l->scene == NEXT || l->scene == PREV) ? 480 : 380;
     if (elapsed >= duration) {
         lights_close(l, 1);

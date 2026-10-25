@@ -93,6 +93,12 @@ pub struct Controls {
     pub keys: Keys,
     pub ring_prefix: Option<String>,
     pub display_prefix: Option<String>,
+    /// Directory of Quasar's ring patterns, played for next, previous and play/pause.
+    pub ring_animations: Option<String>,
+    /// Quasar's colour correction for this body colour (`ledconfigs/*.json`).
+    pub ring_colors: Option<String>,
+    /// Directory of Quasar's clock animations, played for next, previous and pause.
+    pub clock_animations: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,9 +195,16 @@ pub(crate) fn parse(text: &str) -> io::Result<Profile> {
                 "Button codes must be distinct Linux key codes in 1..767",
             ));
         }
-        for path in [&c.input_device, &c.ring_prefix, &c.display_prefix]
-            .into_iter()
-            .flatten()
+        for path in [
+            &c.input_device,
+            &c.ring_prefix,
+            &c.display_prefix,
+            &c.ring_animations,
+            &c.ring_colors,
+            &c.clock_animations,
+        ]
+        .into_iter()
+        .flatten()
         {
             if !valid_path(path) {
                 return Err(invalid(
@@ -346,6 +359,22 @@ pub fn list(state_dir: &Path) -> io::Result<()> {
 }
 
 #[repr(C)]
+struct NativeAnimation<T> {
+    frames: *const T,
+    count: u32,
+}
+impl<T> NativeAnimation<T> {
+    fn of(frames: &[T]) -> Self {
+        Self {
+            frames: frames.as_ptr(),
+            count: frames.len() as u32,
+        }
+    }
+}
+type RingAnimation = NativeAnimation<crate::animations::RingFrame>;
+type ClockAnimation = NativeAnimation<crate::animations::ClockFrame>;
+/// Mirrors `struct mini2_config` in controls/mini2/config.h.
+#[repr(C)]
 struct NativeConfig {
     input: *const c_char,
     ring_prefix: *const c_char,
@@ -353,6 +382,14 @@ struct NativeConfig {
     alice: u32,
     volume_up: u32,
     volume_down: u32,
+    next: RingAnimation,
+    previous: RingAnimation,
+    pause: RingAnimation,
+    resume: RingAnimation,
+    clock_next: ClockAnimation,
+    clock_previous: ClockAnimation,
+    clock_pause: ClockAnimation,
+    volume: RingAnimation,
 }
 unsafe extern "C" {
     fn mini2_buttons_run(config: *const NativeConfig) -> i32;
@@ -371,6 +408,18 @@ impl Controls {
         let ring = string(&self.ring_prefix, caps.ring)?;
         let display = string(&self.display_prefix, caps.display)?;
         let pointer = |s: &Option<CString>| s.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+        // The frames outlive the driver call below, which reads them until it returns.
+        let animations = match (&self.ring_animations, caps.ring) {
+            (Some(directory), true) => crate::animations::Ring::load(
+                Path::new(directory),
+                self.ring_colors.as_deref().map(Path::new),
+            ),
+            _ => crate::animations::Ring::default(),
+        };
+        let clock = match (&self.clock_animations, caps.display) {
+            (Some(directory), true) => crate::animations::Clock::load(Path::new(directory)),
+            _ => crate::animations::Clock::default(),
+        };
         let config = NativeConfig {
             input: pointer(&input),
             ring_prefix: pointer(&ring),
@@ -378,6 +427,14 @@ impl Controls {
             alice: self.keys.alice,
             volume_up: self.keys.volume_up,
             volume_down: self.keys.volume_down,
+            next: NativeAnimation::of(&animations.next),
+            previous: NativeAnimation::of(&animations.previous),
+            pause: NativeAnimation::of(&animations.pause),
+            resume: NativeAnimation::of(&animations.resume),
+            clock_next: NativeAnimation::of(&clock.next),
+            clock_previous: NativeAnimation::of(&clock.previous),
+            clock_pause: NativeAnimation::of(&clock.pause),
+            volume: NativeAnimation::of(&animations.volume),
         };
         Ok(unsafe { mini2_buttons_run(&config) })
     }
