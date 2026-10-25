@@ -6,11 +6,11 @@ Spotify Connect для Яндекс Станций: музыка, голосов
 бинарнике на Rust. Воспроизведение и подключение к Spotify обеспечивает
 [librespot](https://github.com/librespot-org/librespot/tree/v0.8.0).
 
-Изменения Login5 и экспериментальный резервный путь PlayPlay находятся в
-[форке librespot](https://github.com/klockky/librespot/tree/dev).
+Доработки Login5 и Zeroconf, а также экспериментальный резервный путь PlayPlay
+находятся в [форке librespot](https://github.com/klockky/librespot/tree/dev).
 Cargo загружает его по точному коммиту из `Cargo.toml`; `Cargo.lock` фиксирует
 зависимости. Все внутренние крейты librespot берутся из одной ревизии форка.
-Описание изменений и проверки: [SPOTIYA.md](https://github.com/klockky/librespot/blob/24f5f12ff2f4103263ed561db222cec03b861504/SPOTIYA.md).
+Описание изменений и проверки: [SPOTIYA.md](https://github.com/klockky/librespot/blob/ebacab525375858be6932cbc6c9867d74c957f7a/SPOTIYA.md).
 
 Проект поддерживает **первую Мини (YNDX-0004, `yandexmini`)** с glibc 2.23
 и **Мини 2** с glibc 2.30. Обе используют Buildroot и 32-битный ARM
