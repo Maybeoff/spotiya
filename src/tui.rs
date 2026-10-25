@@ -1,7 +1,7 @@
 use crate::control::{self, Status};
 use std::{
     fs,
-    io::{self, IsTerminal, Read, Write},
+    io::{self, IsTerminal, Write},
     os::fd::AsRawFd,
     path::Path,
     sync::mpsc,
@@ -27,12 +27,13 @@ impl Terminal {
             libc::cfmakeraw(&mut raw);
         }
         raw.c_cc[libc::VMIN] = 0;
-        raw.c_cc[libc::VTIME] = 1;
+        raw.c_cc[libc::VTIME] = 0;
         if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        print!("\x1b[?1049h\x1b[?25l");
-        io::stdout().flush()?;
+        let mut out = io::stdout();
+        out.write_all(b"\x1b[?1049h\x1b[?25l")?;
+        out.flush()?;
         if let Ok(mut active) = ACTIVE.lock() {
             *active = Some(saved);
         }
@@ -45,8 +46,10 @@ fn leave(saved: &libc::termios) {
     unsafe {
         libc::tcsetattr(0, libc::TCSANOW, saved);
     }
-    print!("\x1b[0m\x1b[?25h\x1b[?1049l");
-    let _ = io::stdout().flush();
+    // A closed terminal must not turn cleanup into a panic.
+    let mut out = io::stdout();
+    let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1049l");
+    let _ = out.flush();
 }
 pub fn restore_terminal_on_panic() {
     if let Ok(mut active) = ACTIVE.try_lock()
@@ -61,6 +64,43 @@ impl Drop for Terminal {
             *active = None;
         }
         leave(&self.saved);
+    }
+}
+/// Waits up to 100 ms for keys; `None` means the terminal hung up. A raw read alone
+/// cannot tell end of input from a timeout, and would spin once the terminal closes.
+fn read_keys(input: &mut [u8]) -> io::Result<Option<usize>> {
+    let mut pfd = libc::pollfd {
+        fd: 0,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    match unsafe { libc::poll(&mut pfd, 1, 100) } {
+        0 => return Ok(Some(0)),
+        n if n < 0 => {
+            let e = io::Error::last_os_error();
+            return if e.kind() == io::ErrorKind::Interrupted {
+                Ok(Some(0))
+            } else {
+                Err(e)
+            };
+        }
+        _ => {}
+    }
+    if pfd.revents & libc::POLLIN == 0 {
+        return Ok(None);
+    }
+    // Read the descriptor directly: buffered stdin could hold keys that poll no longer sees.
+    match unsafe { libc::read(0, input.as_mut_ptr().cast(), input.len()) } {
+        0 => Ok(None),
+        n if n < 0 => {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                Ok(Some(0))
+            } else {
+                Err(e)
+            }
+        }
+        n => Ok(Some(n as usize)),
     }
 }
 fn size() -> (usize, usize) {
@@ -247,8 +287,9 @@ fn draw_lines(content: Vec<String>, width: usize, height: usize) -> io::Result<(
         frame.push_str("\x1b[0m\x1b[K\r\n");
     }
     frame.push_str("\x1b[J");
-    print!("{frame}");
-    io::stdout().flush()
+    let mut out = io::stdout();
+    out.write_all(frame.as_bytes())?;
+    out.flush()
 }
 struct ProfileMenu {
     entries: Vec<crate::profile_selection::Choice>,
@@ -478,14 +519,25 @@ impl AddonMenu {
     }
 }
 pub fn run(state_dir: &Path, show_addons: bool) -> io::Result<()> {
+    match session(state_dir, show_addons) {
+        // The terminal went away, possibly before the first frame; that ends the session.
+        Err(e) if e.raw_os_error() == Some(libc::EIO) || e.kind() == io::ErrorKind::BrokenPipe => {
+            Ok(())
+        }
+        result => result,
+    }
+}
+fn session(state_dir: &Path, show_addons: bool) -> io::Result<()> {
     use std::io::BufRead;
+    // Declared before the terminal so it drops after it: waiting for an install to stop
+    // must not leave the terminal in raw mode.
+    let mut addon_job: Option<crate::addons::InstallJob> = None;
     let _terminal = Terminal::enter()?;
     let mut status = Status::default();
     let mut notice = "Ready. / searches Spotify; l pairs an account.".to_owned();
     let mut prompt: Option<Vec<u8>> = None;
     let mut profiles: Option<ProfileMenu> = None;
     let mut addons = show_addons.then(AddonMenu::default);
-    let mut addon_job: Option<crate::addons::InstallJob> = None;
     let (addon_messages, addon_rx) = mpsc::channel();
     let mut addon_notice = String::new();
     let (updates, rx) = mpsc::channel::<String>();
@@ -553,7 +605,12 @@ pub fn run(state_dir: &Path, show_addons: bool) -> io::Result<()> {
             last_draw = Instant::now();
         }
         let mut input = [0u8; 64];
-        let n = io::stdin().read(&mut input)?;
+        let Some(n) = read_keys(&mut input)? else {
+            if let Some(s) = login_socket.take() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+            return Ok(());
+        };
         for &key in &input[..n] {
             if key == 3 || key == 4 {
                 if let Some(s) = login_socket.take() {

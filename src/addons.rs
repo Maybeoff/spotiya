@@ -565,6 +565,13 @@ impl Drop for InstallJob {
     fn drop(&mut self) {
         self.cancel();
         if let Some(worker) = self.worker.take() {
+            if !worker.is_finished() {
+                // eprintln! would panic on a closed stderr and skip the join below.
+                let _ = io::Write::write_all(
+                    &mut io::stderr(),
+                    b"Waiting for the add-on installation to stop...\n",
+                );
+            }
             let _ = worker.join();
         }
     }
