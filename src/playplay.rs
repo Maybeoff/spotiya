@@ -1,14 +1,17 @@
 use std::{
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use librespot::{
     audio::playplay::PlayPlayDecoder,
-    core::{Error, playplay::PlayPlayResolver},
+    core::{
+        Error,
+        playplay::{PlayPlayConfig, PlayPlayResolver},
+    },
 };
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 
 pub fn decoder_path(base: &Path) -> Option<PathBuf> {
     [
@@ -26,34 +29,61 @@ pub fn available(base: &Path) -> bool {
     decoder_path(base).is_some()
 }
 
+/// Which decoder binary a configuration came from. Add-on updates and removals replace
+/// the file, so a cached configuration is reused only while the same file is installed.
+#[derive(PartialEq)]
+struct Identity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+}
+impl Identity {
+    fn of(path: PathBuf) -> std::io::Result<Self> {
+        let metadata = path.metadata()?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            path,
+        })
+    }
+}
 pub fn resolver(base: PathBuf) -> PlayPlayResolver {
-    let configuration = Arc::new(OnceCell::new());
+    // Held across the probe so concurrent callers wait for one helper start.
+    let configuration = Arc::new(Mutex::new(None::<(Identity, PlayPlayConfig)>));
     Arc::new(move || {
         let base = base.clone();
         let configuration = configuration.clone();
         Box::pin(async move {
-            let config = configuration
-                .get_or_try_init(|| async move {
-                    let path = decoder_path(&base).ok_or_else(|| {
-                        Error::unavailable(
-                            "PlayPlay decoder missing; install PlayPlay from spotiya addons",
-                        )
-                    })?;
-                    let config =
-                        tokio::task::spawn_blocking(move || PlayPlayDecoder::configuration(&path))
-                            .await
-                            .map_err(|_| Error::aborted("PlayPlay configuration worker stopped"))?
-                            .map_err(|error| {
-                                Error::unavailable(format!(
-                                    "PlayPlay decoder configuration failed ({:?})",
-                                    error.kind()
-                                ))
-                            })?;
-                    eprintln!("receiver: PlayPlay decoder configured on demand");
-                    Ok::<_, Error>(config)
-                })
-                .await?;
-            Ok(config.clone())
+            let mut cached = configuration.lock().await;
+            let identity = decoder_path(&base)
+                .and_then(|path| Identity::of(path).ok())
+                .ok_or_else(|| {
+                    Error::unavailable(
+                        "PlayPlay decoder missing; install PlayPlay from spotiya addons",
+                    )
+                })?;
+            if let Some((known, config)) = cached.as_ref()
+                && *known == identity
+            {
+                return Ok(config.clone());
+            }
+            let path = identity.path.clone();
+            let config = tokio::task::spawn_blocking(move || PlayPlayDecoder::configuration(&path))
+                .await
+                .map_err(|_| Error::aborted("PlayPlay configuration worker stopped"))?
+                .map_err(|error| {
+                    Error::unavailable(format!(
+                        "PlayPlay decoder configuration failed ({:?})",
+                        error.kind()
+                    ))
+                })?;
+            eprintln!("receiver: PlayPlay decoder configured on demand");
+            *cached = Some((identity, config.clone()));
+            Ok(config)
         })
     })
 }
@@ -163,6 +193,23 @@ mod tests {
         assert_eq!(fixture.calls(), 1);
     }
 
+    #[tokio::test]
+    async fn replaced_or_removed_decoder_is_configured_again() {
+        let fixture = Fixture::new(true);
+        let resolve = resolver(fixture.0.clone());
+        resolve().await.unwrap();
+        resolve().await.unwrap();
+        assert_eq!(fixture.calls(), 1);
+        // Add-on updates swap in a new file rather than rewriting the old one.
+        let count = fs::read(fixture.helper().with_extension("count")).unwrap();
+        fs::remove_file(fixture.helper()).unwrap();
+        fixture.install(true);
+        fs::write(fixture.helper().with_extension("count"), count).unwrap();
+        resolve().await.unwrap();
+        assert_eq!(fixture.calls(), 2);
+        fs::remove_file(fixture.helper()).unwrap();
+        assert!(resolve().await.is_err());
+    }
     #[test]
     fn prefers_addon_but_preserves_legacy_manual_installs() {
         let fixture = Fixture::new(true);

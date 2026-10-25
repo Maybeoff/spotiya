@@ -283,6 +283,8 @@ impl Outcome {
                 format!("{} installed; ready on demand", addon.name)
             }
             Outcome::Installed => format!("{} installed", addon.name),
+            // The PlayPlay resolver notices a replaced decoder; running services do not.
+            Outcome::Updated if addon.command.is_none() => format!("{} updated", addon.name),
             Outcome::Updated => format!(
                 "{} updated; restart the receiver to load the new version",
                 addon.name
