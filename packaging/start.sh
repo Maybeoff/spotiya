@@ -12,10 +12,14 @@ if receiver_pid >/dev/null; then
 fi
 rm -f /run/spotify-connect-stop
 nohup setsid "$SPOTIFY_DIR/run.sh" --supervise </dev/null >/tmp/spotify-connect-supervisor.log 2>&1 &
-sleep 1
-if SPOTIFY_PID=$(supervisor_pid); then
-    echo "Spotify Connect started (supervisor pid $SPOTIFY_PID)"
-else
-    echo 'Spotify Connect supervisor failed; see /tmp/spotify-connect-supervisor.log' >&2
-    exit 1
-fi
+# A cold start from slow flash can take several seconds to write the pidfile.
+SPOTIFY_WAIT=0
+until SPOTIFY_PID=$(supervisor_pid); do
+    if [ "$SPOTIFY_WAIT" -ge 50 ]; then
+        echo 'Spotify Connect supervisor failed; see /tmp/spotify-connect-supervisor.log' >&2
+        exit 1
+    fi
+    SPOTIFY_WAIT=$((SPOTIFY_WAIT + SPOTIFY_TICK))
+    pause_briefly
+done
+echo "Spotify Connect started (supervisor pid $SPOTIFY_PID)"
