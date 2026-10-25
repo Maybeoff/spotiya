@@ -20,6 +20,7 @@ use std::{
     io,
     os::fd::AsRawFd,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU16, Ordering},
@@ -55,8 +56,18 @@ mod volume_guard;
 
 struct Command {
     action: i32,
+    deadline: std::time::Instant,
     reply: std::sync::mpsc::SyncSender<bool>,
 }
+const VOICE_EXPIRY: Duration = Duration::from_secs(5);
+struct Prepare {
+    intent: voice::Intent,
+    from_voice: bool,
+    received: Instant,
+    epoch: u64,
+}
+type SpircTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+type Connecting = Pin<Box<dyn Future<Output = Option<Result<(Spirc, SpircTask), Error>>>>>;
 struct Shared {
     running: AtomicBool,
     active: AtomicBool,
@@ -120,13 +131,21 @@ pub extern "C" fn mini2_receiver_command(action: i32) -> i32 {
     if !(0..=4).contains(&action) || !s.active.load(Ordering::Acquire) {
         return 0;
     }
+    let timeout = Duration::from_millis(400);
+    let deadline = std::time::Instant::now() + timeout;
     let (reply, response) = std::sync::mpsc::sync_channel(1);
-    if s.commands.send(Command { action, reply }).is_err() {
+    if s.commands
+        .send(Command {
+            action,
+            deadline,
+            reply,
+        })
+        .is_err()
+    {
         return 0;
     }
-    response
-        .recv_timeout(Duration::from_millis(400))
-        .unwrap_or(false) as i32
+    // A command that misses this deadline is dropped by the receiver, not run late.
+    response.recv_timeout(timeout).unwrap_or(false) as i32
 }
 fn percent(volume: u16) -> u16 {
     ((u32::from(volume) * 100 + 32767) / 65535) as u16
@@ -723,6 +742,21 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("voice: local control socket unavailable");
         }
     });
+    // Native IPC can take up to a second, so it runs beside the event loop in request order.
+    let (native_tx, mut native_rx) = mpsc::channel::<Prepare>(8);
+    let (prepared_tx, mut prepared_rx) = mpsc::channel::<(Prepare, bool)>(8);
+    let native_worker = tokio::spawn(async move {
+        while let Some(request) = native_rx.recv().await {
+            let prepared = voice::prepare_playback(native, request.from_voice)
+                .await
+                .is_ok();
+            if prepared_tx.send((request, prepared)).await.is_err() {
+                break;
+            }
+        }
+    });
+    // Bumped whenever the Spotify connection or ownership changes, so queued intents expire.
+    let mut voice_epoch = 0u64;
     let audio_guard = Arc::new(audio_guard::AudioGuard::new());
     let audio_worker = native.map(|address| {
         let guard = audio_guard.clone();
@@ -747,6 +781,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let mut credentials = cache.credentials();
     let mut spirc: Option<Spirc> = None;
     let mut task: Option<JoinHandle<()>> = None;
+    let mut connecting: Option<Connecting> = None;
     let mut retry_at = Instant::now();
     let mut backoff = 5;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -809,32 +844,36 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             _=tokio::signal::ctrl_c()=>break,
             fresh=discovery.next()=>{
                 let Some(fresh)=fresh else { eprintln!("receiver: discovery stopped"); break; };
-                audio_guard.set_playing(false);
+                audio_guard.set_playing(false);connecting=None;voice_epoch+=1;
+                if let Some(reply)=pending_login.take(){let _=reply.send(Err("Login was replaced by another Spotify device"));}
                 stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
                 failures.reset();retry_track=None;
                 credentials=Some(fresh); retry_at=Instant::now(); backoff=5;
             },
             Some(login)=login_rx.recv()=>{
-                audio_guard.set_playing(false);
+                audio_guard.set_playing(false);connecting=None;voice_epoch+=1;
+                if let Some(reply)=pending_login.take(){let _=reply.send(Err("Login was replaced by a newer login"));}
                 stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
                 failures.reset();retry_track=None;
                 credentials=Some(login.credentials);pending_login=Some(login.completed);
                 retry_at=Instant::now();backoff=5;
             },
-            _=tokio::time::sleep_until(retry_at), if spirc.is_none() && credentials.is_some() && !failures.blocked()=>{
+            _=tokio::time::sleep_until(retry_at), if spirc.is_none() && connecting.is_none() && credentials.is_some() && !failures.blocked()=>{
                 session=Session::new(config.clone(),Some(cache.clone()));
                 session.audio_key().set_playplay_resolver(Some(playplay.clone()));
                 player.set_session(session.clone());
                 let connect=ConnectConfig { name:options.name.clone(), initial_volume:mixer.volume(),
                     volume_steps:100, device_type:DeviceType::Speaker, ..Default::default() };
                 let attempt=Spirc::new(connect,session.clone(),credentials.clone().unwrap(),player.clone(),mixer.clone());
-                let result=tokio::select! {
-                    _=terminate.recv()=>break,
-                    _=tokio::signal::ctrl_c()=>break,
-                    result=tokio::time::timeout(Duration::from_secs(30),attempt)=>result,
-                };
+                connecting=Some(Box::pin(async move {
+                    tokio::time::timeout(Duration::from_secs(30),attempt).await.ok()
+                        .map(|result| result.map(|(handle,future)| (handle,Box::pin(future) as SpircTask)))
+                }));
+            },
+            result=async {match connecting.as_mut() {Some(attempt)=>attempt.await,None=>std::future::pending().await}}, if connecting.is_some()=>{
+                connecting=None;
                 match result {
-                    Ok(Ok((handle,future)))=>{
+                    Some(Ok((handle,future)))=>{
                         spirc=Some(handle);task=Some(tokio::spawn(future));backoff=5;eprintln!("receiver: Spotify connected");
                         if let Some(reply)=pending_login.take(){let _=reply.send(Ok(()));}
                         if let Some(uri)=retry_track.take() && let Some(handle)=spirc.as_ref() {
@@ -843,27 +882,27 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                             let _=handle.load(request);
                         }
                     },
-                    Ok(Err(e))=>{
+                    Some(Err(e))=>{
                         if let Some(reply)=pending_login.take(){let _=reply.send(Err("Receiver could not connect the new account"));}
                         eprintln!("receiver: connect failed ({:?}); discovery remains available",e.kind);
                         if e.kind==librespot::core::error::ErrorKind::Unauthenticated {credentials=None;}
                         session.shutdown(); retry_at=Instant::now()+Duration::from_secs(backoff);backoff=(backoff*2).min(60);
                     },
-                    Err(_)=>{
+                    None=>{
                         if let Some(reply)=pending_login.take(){let _=reply.send(Err("Receiver connect timed out"));}
                         session.shutdown();retry_at=Instant::now()+Duration::from_secs(backoff);backoff=(backoff*2).min(60);eprintln!("receiver: connect timeout");
                     },
                 }
             },
             _=async {if let Some(task)=task.as_mut(){let _=task.await;}}, if task.is_some()=>{
-                spirc=None;task=None;session.shutdown();playback.reset();
+                spirc=None;task=None;session.shutdown();playback.reset();voice_epoch+=1;
                 retry_at=Instant::now()+Duration::from_secs(5);eprintln!("receiver: reconnect scheduled");
             },
             Some(event)=events.recv()=>{
                 if failures.blocked() || !playback.update(&event) {continue;}
                 if failures.observe(&event) {
                     log::warn!("receiver: {}",failures.message());
-                    audio_guard.set_playing(false);player.stop();
+                    audio_guard.set_playing(false);player.stop();voice_epoch+=1;
                     stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
                     while events.try_recv().is_ok() {}
                 }
@@ -899,13 +938,10 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                             shared.airplay.active.store(true,Ordering::Release);
                             if let Some(handle)=spirc.as_ref(){let _=handle.disconnect(true);}
                             player.stop();playback.reset();
-                            let deadline=Instant::now()+Duration::from_millis(1500);
-                            while shared.airplay.spotify_open.load(Ordering::Acquire) && Instant::now()<deadline {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
-                            }
-                            let accepted=shared.airplay.active.load(Ordering::Acquire) && !shared.airplay.spotify_open.load(Ordering::Acquire);
+                            let released=shared.airplay.spotify_released(Instant::now()+Duration::from_millis(1500)).await;
+                            let accepted=shared.airplay.active.load(Ordering::Acquire) && released;
                             if accepted {
-                                if let Some(address)=native {let _=voice::pause_native(address).await;}
+                                if let Some(address)=native {tokio::spawn(voice::pause_native(address));}
                                 info.title.clear();info.artist.clear();info.album.clear();info.duration_ms=0;
                             } else {airplay.stop(&shared.airplay).await;}
                             accepted
@@ -920,6 +956,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 let _=request.reply.send(accepted);
             },
             Some(command)=command_rx.recv()=>{
+                if std::time::Instant::now()>=command.deadline {continue;}
                 let ok=if shared.airplay.active.load(Ordering::Acquire) {
                     if command.action==0 {airplay.stop(&shared.airplay).await;true}
                     else if matches!(command.action,3|4){
@@ -943,7 +980,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 let _=command.reply.send(ok);
             },
             Some(event)=voice_rx.recv()=>{
-                if event.received.elapsed()>Duration::from_secs(5) {continue;}
+                if event.received.elapsed()>VOICE_EXPIRY {continue;}
                 if event.from_voice && !voice_enabled {continue;}
                 let intent=match event.intent {
                     voice::Intent::Airplay(enabled)=>{
@@ -985,6 +1022,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                     voice::Intent::Release=>{
                         if shared.airplay.active.load(Ordering::Acquire) {airplay.stop(&shared.airplay).await;}
                         if let Some(handle)=spirc.as_ref(){let _=handle.disconnect(true);}
+                        voice_epoch+=1;
                         playback.reset();shared.paused.store(false,Ordering::Relaxed);
                         shared.active.store(false,Ordering::Release);audio_guard.set_playing(false);
                         continue;
@@ -1001,22 +1039,35 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                     else {continue;}
                 }
                 if failures.blocked() {continue;}
+                if spirc.is_none() {eprintln!("voice: Spotify is not connected yet");continue;}
+                let active=shared.active.load(Ordering::Acquire);
+                let wanted=match intent {
+                    voice::Intent::Play(_)=>true,
+                    voice::Intent::Resume if !active && last_track.is_some()=>true,
+                    _=>active,
+                };
+                let request=Prepare{intent,from_voice:event.from_voice,received:event.received,epoch:voice_epoch};
+                if wanted && native_tx.try_send(request).is_err() {eprintln!("voice: native command queue is full");}
+            },
+            Some((request,prepared))=prepared_rx.recv()=>{
+                if request.epoch!=voice_epoch || request.received.elapsed()>VOICE_EXPIRY {eprintln!("voice: stale command dropped");continue;}
+                if shared.airplay.active.load(Ordering::Acquire) || failures.blocked() {continue;}
+                let intent=request.intent;
                 let Some(handle)=spirc.as_ref() else {eprintln!("voice: Spotify is not connected yet");continue;};
                 match intent {
                     voice::Intent::Play(query)=>{
-                        if voice::prepare_playback(native,event.from_voice).await.is_err() {eprintln!("voice: could not cancel native conversation");continue;}
+                        if !prepared {eprintln!("voice: could not cancel native conversation");continue;}
                         let _=handle.activate();
                         let request=LoadRequest::from_context_uri(voice::context(&query),LoadRequestOptions{start_playing:true,..Default::default()});
                         if handle.load(request).is_ok() {eprintln!("voice: Spotify music query queued");}
                     },
                     voice::Intent::Resume if !shared.active.load(Ordering::Acquire) && last_track.is_some()=>{
-                        if voice::prepare_playback(native,event.from_voice).await.is_err() {continue;}
+                        if !prepared {continue;}
                         let _=handle.activate();
                         let request=LoadRequest::from_tracks(vec![last_track.clone().unwrap()],LoadRequestOptions{start_playing:true,..Default::default()});
                         if handle.load(request).is_ok() {eprintln!("voice: last Spotify track queued");}
                     },
                     intent if shared.active.load(Ordering::Acquire)=>{
-                        let _=voice::prepare_playback(native,event.from_voice).await;
                         match intent {
                             voice::Intent::Pause=>{let _=handle.pause();},
                             voice::Intent::Resume=>{let _=handle.play();},
@@ -1076,6 +1127,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(worker) = voice_watch {
         worker.abort();
     }
+    native_worker.abort();
     audio_guard.set_playing(false);
     if let Some(worker) = audio_worker {
         worker.abort();

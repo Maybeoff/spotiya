@@ -190,7 +190,7 @@ impl Sink for VisualSink {
             })
             .and_then(|()| self.inner.start());
         if result.is_err() {
-            self.gate.spotify_open.store(false, Ordering::Release);
+            self.gate.close_spotify();
         }
         result?;
         Ok(())
@@ -198,7 +198,7 @@ impl Sink for VisualSink {
     fn stop(&mut self) -> SinkResult<()> {
         self.spectrum.clear();
         let result = self.inner.stop();
-        self.gate.spotify_open.store(false, Ordering::Release);
+        self.gate.close_spotify();
         result
     }
     fn write(&mut self, mut packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
@@ -222,7 +222,7 @@ impl Sink for VisualSink {
 impl Drop for VisualSink {
     fn drop(&mut self) {
         let _ = self.inner.stop();
-        self.gate.spotify_open.store(false, Ordering::Release);
+        self.gate.close_spotify();
     }
 }
 

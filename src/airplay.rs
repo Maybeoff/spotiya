@@ -13,13 +13,14 @@ use std::{
 };
 use tokio::{
     process::{Child, Command},
-    sync::oneshot,
+    sync::{Notify, oneshot},
     time::Instant,
 };
 
 pub struct Gate {
     pub active: AtomicBool,
     pub spotify_open: AtomicBool,
+    spotify_closed: Notify,
     pid: Mutex<u32>,
     preempted: AtomicBool,
 }
@@ -28,8 +29,27 @@ impl Gate {
         Self {
             active: AtomicBool::new(false),
             spotify_open: AtomicBool::new(false),
+            spotify_closed: Notify::new(),
             pid: Mutex::new(0),
             preempted: AtomicBool::new(false),
+        }
+    }
+    pub fn close_spotify(&self) {
+        self.spotify_open.store(false, Ordering::Release);
+        self.spotify_closed.notify_waiters();
+    }
+    /// Waits until the Spotify sink has closed the audio device, or the deadline passes.
+    pub async fn spotify_released(&self, deadline: Instant) -> bool {
+        loop {
+            let closed = self.spotify_closed.notified();
+            tokio::pin!(closed);
+            closed.as_mut().enable();
+            if !self.spotify_open.load(Ordering::Acquire) {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, closed).await.is_err() {
+                return !self.spotify_open.load(Ordering::Acquire);
+            }
         }
     }
     pub fn reclaim(&self) -> io::Result<()> {
@@ -433,6 +453,27 @@ impl Drop for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn handover_waits_for_the_spotify_sink_to_close() {
+        let gate = std::sync::Arc::new(Gate::new());
+        assert!(gate.spotify_released(Instant::now()).await);
+        gate.spotify_open.store(true, Ordering::Release);
+        assert!(
+            !gate
+                .spotify_released(Instant::now() + Duration::from_millis(20))
+                .await
+        );
+        let sink = gate.clone();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            sink.close_spotify();
+        });
+        assert!(
+            gate.spotify_released(Instant::now() + Duration::from_secs(5))
+                .await
+        );
+        closer.join().unwrap();
+    }
     #[test]
     fn hooks_reject_stale_or_malformed_values() {
         let token = uuid::Uuid::new_v4();
