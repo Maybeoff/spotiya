@@ -559,7 +559,7 @@ scripts/build-airplay.sh
 ```
 
 Нужны инструменты сборки C/C++, Python 3, CMake, Autoconf, Automake, Libtool,
-gettext, pkg-config, flex, bison, xxd и host-программа `plistutil`.
+gettext, pkg-config, flex, bison, xxd, patch и host-программа `plistutil`.
 Исходники зависимостей закреплены в `airplay/sources.json` с SHA256;
 ревизии Shairport Sync и NQPTP закреплены в `airplay/fetch.py`.
 

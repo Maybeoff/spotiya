@@ -111,7 +111,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config curl bzip2 xz-utils cmake autoconf automake libtool libtool-bin gettext flex bison texinfo libplist-utils xxd
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config curl bzip2 xz-utils cmake autoconf automake libtool libtool-bin gettext flex bison texinfo libplist-utils xxd patch
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ~/.cache/spotiya

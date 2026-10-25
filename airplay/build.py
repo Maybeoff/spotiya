@@ -86,15 +86,12 @@ def build(name):
     elif name == 'dbus':
         auto(name, ['--disable-tests', '--disable-xml-docs', '--disable-doxygen-docs', '--disable-ducktype-docs', '--disable-selinux', '--disable-apparmor', '--disable-libaudit', '--disable-systemd', '--disable-x11-autolaunch', '--without-x', '--disable-verbose-mode', '--disable-asserts', '--disable-stats', '--disable-Werror', '--with-system-socket=/run/dbus/system_bus_socket', '--with-system-pid-file=/run/dbus/pid', '--sysconfdir=/etc', '--localstatedir=/var'])
     elif name == 'avahi':
-        source = ROOT/'avahi/avahi-core/iface.c'
-        text = source.read_text()
-        old = 'index, p, 0, NULL, &a->address)'
-        new = 'index, p, AVAHI_PUBLISH_NO_REVERSE, NULL, &a->address)'
-        if old in text:
-            assert text.count(old) == 1
-            source.write_text(text.replace(old, new))
-        elif new not in text:
-            raise RuntimeError('Unexpected Avahi address registration source')
+        # Apply the shipped patch itself, so the package documents exactly what was built.
+        patch = str(RECIPE/'avahi-no-reverse.patch')
+        # --force: never guess the direction; --batch would silently treat a reverse check as forward.
+        applied = subprocess.run(['patch', '-p1', '--reverse', '--force', '--dry-run', '--silent', '-i', patch], cwd=ROOT/name, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        if not applied:
+            run(name, ['patch', '-p1', '--forward', '--force', '-i', patch])
         auto(name, ['--with-distro=none', '--disable-nls', '--disable-glib', '--disable-gobject', '--disable-introspection', '--disable-libevent', '--disable-qt3', '--disable-qt4', '--disable-qt5', '--disable-gtk', '--disable-gtk3', '--disable-gdbm', '--disable-python', '--disable-pygobject', '--disable-python-dbus', '--disable-mono', '--disable-monodoc', '--disable-autoipd', '--disable-doxygen-doc', '--disable-manpages', '--disable-xmltoman', '--disable-stack-protector', '--disable-ssp', '--with-xml=expat', '--with-dbus-sys=/etc/dbus-1/system.d', '--sysconfdir=/etc', '--localstatedir=/var', '--with-avahi-user=nobody', '--with-avahi-group=nogroup', '--with-systemdsystemunitdir=/nonexistent'])
     elif name == 'nqptp':
         run(name, ['autoreconf', '-fi'])
