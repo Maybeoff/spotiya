@@ -33,16 +33,34 @@ impl Terminal {
         }
         print!("\x1b[?1049h\x1b[?25l");
         io::stdout().flush()?;
+        if let Ok(mut active) = ACTIVE.lock() {
+            *active = Some(saved);
+        }
         Ok(Self { saved })
+    }
+}
+/// Terminal settings to put back if the TUI panics, since release builds abort without `Drop`.
+static ACTIVE: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
+fn leave(saved: &libc::termios) {
+    unsafe {
+        libc::tcsetattr(0, libc::TCSANOW, saved);
+    }
+    print!("\x1b[0m\x1b[?25h\x1b[?1049l");
+    let _ = io::stdout().flush();
+}
+pub fn restore_terminal_on_panic() {
+    if let Ok(mut active) = ACTIVE.try_lock()
+        && let Some(saved) = active.take()
+    {
+        leave(&saved);
     }
 }
 impl Drop for Terminal {
     fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(0, libc::TCSANOW, &self.saved);
+        if let Ok(mut active) = ACTIVE.lock() {
+            *active = None;
         }
-        print!("\x1b[0m\x1b[?25h\x1b[?1049l");
-        let _ = io::stdout().flush();
+        leave(&self.saved);
     }
 }
 fn size() -> (usize, usize) {

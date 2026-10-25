@@ -1,11 +1,11 @@
 use crate::profiles::{self, Profile};
 use serde::{Deserialize, Serialize};
 use std::{
+    ffi::OsStr,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::Path,
-    process::Command,
     time::{Duration, Instant},
 };
 
@@ -219,14 +219,18 @@ fn transaction(
     let target = profiles::resolve_saved(saved.clone(), state)?.profile.id;
     atomic_write(state, &serde_json::to_vec_pretty(saved)?)?;
     if let Err(error) = apply(&target) {
-        if let Some(data) = previous {
-            atomic_write(state, &data)?;
-        } else {
-            fs::remove_file(state.join(SETTING))?;
-        }
+        let restored = match previous {
+            Some(data) => atomic_write(state, &data),
+            None => fs::remove_file(state.join(SETTING)),
+        };
+        // Recover the receiver even if the old selection could not be written back.
         let recovered = old_id.is_some_and(|id| apply(&id).is_ok());
         return Err(io::Error::other(format!(
-            "Profile switch failed: {error}. Previous selection restored; receiver recovery {}",
+            "Profile switch failed: {error}. {}; receiver recovery {}",
+            match restored {
+                Ok(()) => "Previous selection restored".into(),
+                Err(e) => format!("Previous selection could not be restored ({e})"),
+            },
             if recovered {
                 "succeeded"
             } else {
@@ -243,9 +247,12 @@ fn service_pid(file: &str) -> Option<u32> {
 }
 fn restart(state: &Path, expected: &str) -> io::Result<()> {
     let selection = read(state)?.map_or_else(|| "auto".into(), |s| s.selection);
-    let output = Command::new("/etc/init.d/S99spotify-connect")
-        .arg("restart")
-        .output()?;
+    // Stop may wait 8 seconds for the receiver, so allow that plus a start.
+    let output = crate::installation::command(
+        Path::new("/etc/init.d/S99spotify-connect"),
+        &[OsStr::new("restart")],
+        Duration::from_secs(20),
+    )?;
     if !output.status.success() {
         return Err(io::Error::other(
             "Receiver restart failed; see supervisor log",

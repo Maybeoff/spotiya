@@ -6,6 +6,7 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -91,6 +92,14 @@ impl Drop for Temporary {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+/// Set while this process holds a read-only root remounted read-write.
+static ROOT_WRITABLE: AtomicBool = AtomicBool::new(false);
+/// Release builds abort on panic without running `Drop`, so the panic hook calls this.
+pub fn restore_root_on_panic() {
+    if ROOT_WRITABLE.swap(false, Ordering::AcqRel) {
+        let _ = RootMount::remount("remount,ro");
+    }
+}
 struct RootMount(bool);
 impl RootMount {
     fn writable() -> io::Result<Self> {
@@ -101,6 +110,7 @@ impl RootMount {
         });
         if readonly {
             Self::remount("remount,rw")?;
+            ROOT_WRITABLE.store(true, Ordering::Release);
         }
         Ok(Self(readonly))
     }
@@ -120,6 +130,7 @@ impl RootMount {
         if self.0 {
             Self::remount("remount,ro")?;
             self.0 = false;
+            ROOT_WRITABLE.store(false, Ordering::Release);
         }
         Ok(())
     }
@@ -275,18 +286,32 @@ fn restore(layout: &Layout, backup: &Path) -> io::Result<()> {
     if manifest.version != 1 || manifest.files.iter().any(|f| !FILES.contains(&f.as_str())) {
         return Err(error("Invalid backup manifest"));
     }
+    // Keep restoring after a failed file so one bad path does not leave a mixed install.
+    let mut failed = vec![];
     for &file in FILES {
         let destination = layout.destination(file);
-        if manifest.files.iter().any(|f| f == file) {
-            copy_atomic(&backup.join(file), &destination)?;
+        let result = if manifest.files.iter().any(|f| f == file) {
+            copy_atomic(&backup.join(file), &destination)
         } else if destination.exists() {
-            fs::remove_file(destination)?;
+            fs::remove_file(destination)
+        } else {
+            Ok(())
+        };
+        if let Err(e) = result {
+            failed.push(format!("{file}: {e}"));
         }
     }
-    if !manifest.cli_existed && fs::symlink_metadata(&layout.cli).is_ok() {
-        fs::remove_file(&layout.cli)?;
+    if !manifest.cli_existed
+        && fs::symlink_metadata(&layout.cli).is_ok()
+        && let Err(e) = fs::remove_file(&layout.cli)
+    {
+        failed.push(format!("{}: {e}", layout.cli.display()));
     }
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(error(format!("Could not restore {}", failed.join("; "))))
+    }
 }
 fn prune(base: &Path, keep: usize) -> io::Result<()> {
     let mut backups = vec![];
@@ -388,20 +413,19 @@ fn transaction(
     })();
     if let Err(cause) = result {
         let _ = service.stop();
-        let recovered = restore(layout, &backup).and_then(|()| {
-            if running && had_service {
-                service.start()?;
-                service.ready(profile)?;
-            }
+        let restored = restore(layout, &backup);
+        // Start the receiver even after a partial restore; whatever is on disk beats nothing.
+        let started = if running && had_service {
+            service.start().and_then(|()| service.ready(profile))
+        } else {
             Ok(())
-        });
+        };
+        let rollback = match restored.and(started) {
+            Ok(()) => "succeeded".into(),
+            Err(e) => format!("needs attention ({e})"),
+        };
         return Err(error(format!(
-            "Installation failed: {cause}. Rollback {}. Backup: {}",
-            if recovered.is_ok() {
-                "succeeded"
-            } else {
-                "needs attention"
-            },
+            "Installation failed: {cause}. Rollback {rollback}. Backup: {}",
             backup.display()
         )));
     }
@@ -456,8 +480,17 @@ pub fn install(root: &Path, binary: &Path, newer_only: bool) -> io::Result<()> {
         || live_pid(&layout.base, Path::new("/run/spotiya-supervisor.pid")).is_some();
     let mut mount = RootMount::writable()?;
     let result = transaction(&layout, root, binary, running, profile, &mut SystemService);
-    mount.restore()?;
-    let backup = result?;
+    // The transaction outcome matters more than the remount, so neither error hides the other.
+    let remount = mount.restore();
+    let backup = match (result, remount) {
+        (Ok(backup), Ok(())) => backup,
+        (Ok(backup), Err(e)) => {
+            eprintln!("Warning: {e}; root filesystem stays writable until reboot");
+            backup
+        }
+        (Err(cause), Ok(())) => return Err(cause),
+        (Err(cause), Err(e)) => return Err(error(format!("{cause}. Also: {e}"))),
+    };
     println!(
         "Installed spotiya {version}; {}. Backup: {}",
         if running {
@@ -553,6 +586,30 @@ mod tests {
             fs::read(layout.base.join("receiver-state/credentials.json")).unwrap(),
             b"private fixture"
         );
+    }
+    #[test]
+    fn restore_continues_past_a_file_it_cannot_write() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_temp, layout, _root) = fixture();
+        let backup = snapshot(&layout).unwrap();
+        for &f in FILES {
+            fs::write(layout.destination(f), b"new").unwrap();
+        }
+        let profiles = layout.base.join("profiles");
+        fs::set_permissions(&profiles, fs::Permissions::from_mode(0o555)).unwrap();
+        let failure = restore(&layout, &backup).unwrap_err().to_string();
+        fs::set_permissions(&profiles, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(failure.contains("profiles/mini1.json"), "{failure}");
+        for &f in FILES {
+            let expected: &[u8] = if f.starts_with("profiles/") {
+                b"new"
+            } else {
+                b"old"
+            };
+            assert_eq!(fs::read(layout.destination(f)).unwrap(), expected, "{f}");
+        }
     }
     #[test]
     fn first_install_creates_profile_directory_and_does_not_stop_a_missing_service() {

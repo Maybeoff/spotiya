@@ -603,6 +603,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe extern "C" {
         fn spotiya_native_stderr();
     }
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tui::restore_terminal_on_panic();
+        installation::restore_root_on_panic();
+        report(info);
+    }));
     unsafe {
         spotiya_native_stderr();
         libc::umask(0o077);
