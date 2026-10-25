@@ -70,7 +70,7 @@ jobs:
           cargo test --locked --manifest-path .cache/librespot/Cargo.toml -p librespot-core -p librespot-audio -p librespot-discovery --no-default-features --features librespot-core/rustls-tls-webpki-roots,librespot-audio/rustls-tls-webpki-roots,librespot-discovery/rustls-tls-webpki-roots --lib
       - run: make -C controls/mini2 check
       - run: shellcheck install.sh scripts/*.sh packaging/*.sh packaging/S99spotify-connect
-      - run: python3 -m py_compile bin/spotiya decoder/prepare.py decoder/package.py
+      - run: python3 -m py_compile bin/spotiya decoder/prepare.py decoder/package.py airplay/build.py airplay/fetch.py airplay/package.py
       - run: python3 -m unittest discover -s tests -p 'test_*.py'
 
   arm:
@@ -80,7 +80,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config curl bzip2 xz-utils
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config curl bzip2 xz-utils qemu-user
       - run: rustup toolchain install 1.98.0 --profile minimal --target armv7-unknown-linux-gnueabihf
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -92,6 +92,7 @@ jobs:
           key: arm-${{ runner.os }}-rust-1.98.0-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'scripts/bootstrap-arm.sh') }}
       - run: scripts/bootstrap-arm.sh
       - run: scripts/build-arm.sh
+      - run: scripts/smoke-arm.sh
       - run: scripts/package.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
