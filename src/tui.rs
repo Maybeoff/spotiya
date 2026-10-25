@@ -338,14 +338,19 @@ struct AddonMenu {
     selected: usize,
     escape: u8,
     escape_at: Option<Instant>,
+    confirm_remove: bool,
 }
 enum AddonAction {
     Apply,
     Cancel,
     StopInstall,
+    Update,
+    Remove,
 }
 impl AddonMenu {
     fn key(&mut self, key: u8) -> Option<AddonAction> {
+        // Removal needs a second x; any other byte, including escape sequences, cancels it.
+        let confirmed = std::mem::take(&mut self.confirm_remove);
         if key == 27 {
             self.escape = 1;
             self.escape_at = Some(Instant::now());
@@ -366,6 +371,12 @@ impl AddonMenu {
             key
         };
         match key {
+            b'x' if confirmed => Some(AddonAction::Remove),
+            b'x' => {
+                self.confirm_remove = true;
+                None
+            }
+            b'u' => Some(AddonAction::Update),
             b'q' => Some(AddonAction::Cancel),
             b'c' => Some(AddonAction::StopInstall),
             b'\r' | b'\n' | b'e' => Some(AddonAction::Apply),
@@ -415,6 +426,8 @@ impl AddonMenu {
         out.push(addon.description.into());
         if installing == Some(addon.id) {
             out.push("Installation in progress. c: cancel download".into());
+        } else if self.confirm_remove {
+            out.push(format!("Press x again to remove {}", addon.name));
         } else if state.installed && addon.command.is_none() {
             out.push(
                 "Ready; used automatically when ordinary Spotify audio keys are refused.".into(),
@@ -439,6 +452,9 @@ impl AddonMenu {
                 "GitHub Releases: klockky/spotiya v{}",
                 env!("CARGO_PKG_VERSION")
             ));
+        }
+        if state.installed && installing != Some(addon.id) {
+            out.push("u: update   x: remove".into());
         }
         if !state.error.is_empty() {
             out.push(safe(state.error));
@@ -501,24 +517,22 @@ pub fn run(state_dir: &Path, show_addons: bool) -> io::Result<()> {
                 crate::addons::Message::Progress(text) => addon_notice = text,
                 crate::addons::Message::Finished(result) => {
                     if let Some(job) = addon_job.take() {
+                        let addon = crate::addons::find(job.id)?;
                         addon_notice = match result {
                             Err(e) => e.to_string(),
-                            Ok(()) => {
-                                let addon = crate::addons::find(job.id)?;
-                                match addon.command {
-                                    None => format!("{} installed; ready on demand", addon.name),
-                                    Some(command) => {
-                                        match control::request(&format!("{command} ON")) {
-                                            Ok(_) => {
-                                                format!("{} installed; enabling...", addon.name)
-                                            }
-                                            Err(e) => format!(
-                                                "Installed. Enable it after starting the receiver: {e}"
-                                            ),
+                            Ok(outcome) => match addon.command {
+                                Some(command) if outcome == crate::addons::Outcome::Installed => {
+                                    match control::request(&format!("{command} ON")) {
+                                        Ok(_) => {
+                                            format!("{} installed; enabling...", addon.name)
                                         }
+                                        Err(e) => format!(
+                                            "Installed. Enable it after starting the receiver: {e}"
+                                        ),
                                     }
                                 }
-                            }
+                                _ => outcome.message(addon),
+                            },
                         };
                     }
                 }
@@ -550,6 +564,36 @@ pub fn run(state_dir: &Path, show_addons: bool) -> io::Result<()> {
                         if let Some(job) = &mut addon_job {
                             job.cancel();
                             addon_notice = "Cancelling download...".into();
+                        }
+                    }
+                    Some(AddonAction::Remove) => {
+                        let addon = &crate::addons::CATALOG[menu.selected];
+                        addon_notice = if addon_job.is_some() {
+                            "An add-on installation is already running".into()
+                        } else {
+                            match crate::addons::remove(
+                                addon.id,
+                                Path::new(crate::installation::BASE),
+                            ) {
+                                Ok(()) => format!("{} removed", addon.name),
+                                Err(e) => e.to_string(),
+                            }
+                        };
+                    }
+                    Some(AddonAction::Update) => {
+                        let addon = &crate::addons::CATALOG[menu.selected];
+                        if addon_job.is_some() {
+                            addon_notice = "An add-on installation is already running".into();
+                        } else if !(addon.state)(&status).installed {
+                            addon_notice = format!("{} is not installed", addon.name);
+                        } else {
+                            match crate::addons::InstallJob::start(addon, addon_messages.clone()) {
+                                Ok(job) => {
+                                    addon_job = Some(job);
+                                    addon_notice = "Checking for an add-on update...".into();
+                                }
+                                Err(e) => addon_notice = e.to_string(),
+                            }
                         }
                     }
                     Some(AddonAction::Apply) => {
@@ -774,6 +818,22 @@ mod tests {
         let frame = menu.lines(&status, 24, None, "");
         assert!(frame.iter().any(|s| s.contains("[Running]")));
         assert!(frame.iter().any(|s| s == "Enter: disable AirPlay 2"));
+        assert!(frame.iter().any(|s| s == "u: update   x: remove"));
+        assert!(matches!(menu.key(b'u'), Some(AddonAction::Update)));
+        assert!(menu.key(b'x').is_none());
+        assert!(
+            menu.lines(&status, 24, None, "")
+                .iter()
+                .any(|s| s == "Press x again to remove AirPlay 2")
+        );
+        assert!(menu.key(b'j').is_none());
+        assert!(menu.key(b'k').is_none());
+        assert!(menu.key(b'x').is_none());
+        for key in b"\x1b[C" {
+            assert!(menu.key(*key).is_none());
+        }
+        assert!(menu.key(b'x').is_none());
+        assert!(matches!(menu.key(b'x'), Some(AddonAction::Remove)));
         for key in b"\x1b[B" {
             assert!(menu.key(*key).is_none());
         }

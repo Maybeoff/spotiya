@@ -6,9 +6,11 @@ case "${1:-tui}" in
         shift
         if [ "$#" -eq 2 ] && [ "$1" = install ]; then
             set -- --addon-install "$2"
+        elif [ "$#" -eq 2 ] && [ "$1" = remove ]; then
+            set -- --addon-remove "$2"
         elif [ "$#" -eq 4 ] && [ "$1" = file ]; then
             set -- --addon-install-file "$2" "$3" "$4"
-        else echo 'Usage: spotiya addon install ID | spotiya addon file ID ARCHIVE SHA256SUMS' >&2; exit 1; fi
+        else echo 'Usage: spotiya addon install ID | spotiya addon remove ID | spotiya addon file ID ARCHIVE SHA256SUMS' >&2; exit 1; fi
         ;;
     start|stop|restart)
         exec /etc/init.d/S99spotify-connect "$1"

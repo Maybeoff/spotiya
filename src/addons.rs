@@ -27,6 +27,10 @@ pub struct Addon {
     root: &'static str,
     directory: &'static str,
     bins: &'static [&'static str],
+    /// Receiver setting that keeps the add-on running; it must be off before removal.
+    setting: Option<&'static str>,
+    /// Older single-file location that still counts as installed.
+    legacy: Option<&'static str>,
     pub command: Option<&'static str>,
     pub state: fn(&Status) -> State<'_>,
 }
@@ -63,6 +67,8 @@ pub static CATALOG: &[Addon] = &[
         root: "spotiya-airplay2",
         directory: "airplay",
         bins: AIRPLAY_BINS,
+        setting: Some("airplay-enabled"),
+        legacy: None,
         command: Some("AIRPLAY"),
         state: |s| State {
             installed: s.airplay_available,
@@ -80,6 +86,8 @@ pub static CATALOG: &[Addon] = &[
         root: "spotiya-playplay",
         directory: "playplay",
         bins: &["playplay-decoder"],
+        setting: None,
+        legacy: Some("playplay-decoder"),
         command: None,
         state: |s| State {
             installed: s.playplay_available,
@@ -261,13 +269,47 @@ fn validate_binaries(addon: &Addon, payload: &Path) -> io::Result<()> {
     }
     Ok(())
 }
+#[derive(Debug, PartialEq)]
+pub enum Outcome {
+    Installed,
+    Updated,
+    Current,
+}
+impl Outcome {
+    pub fn message(&self, addon: &Addon) -> String {
+        match self {
+            Outcome::Installed if addon.command.is_none() => {
+                format!("{} installed; ready on demand", addon.name)
+            }
+            Outcome::Installed => format!("{} installed", addon.name),
+            Outcome::Updated => format!(
+                "{} updated; restart the receiver to load the new version",
+                addon.name
+            ),
+            Outcome::Current => format!("{} is already up to date", addon.name),
+        }
+    }
+}
+#[cfg(not(test))]
+use fs::rename;
+#[cfg(test)]
+thread_local! {
+    static FAIL_RENAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    if FAIL_RENAMES.get() {
+        return Err(error("injected rename failure"));
+    }
+    fs::rename(from, to)
+}
 fn install_verified(
     addon: &Addon,
     base: &Path,
     archive: &Path,
     sums: &str,
     validate: impl FnOnce(&Addon, &Path) -> io::Result<()>,
-) -> io::Result<()> {
+) -> io::Result<Outcome> {
     if fs::metadata(archive)?.len() > MAX_ARCHIVE {
         return Err(error("Add-on archive exceeds 16 MiB"));
     }
@@ -277,9 +319,7 @@ fn install_verified(
     let _lock = crate::file_lock(&base.join("receiver-state"), "install.lock")
         .map_err(|_| error("Another installation is running"))?;
     let target = base.join(addon.directory);
-    if target.symlink_metadata().is_ok() {
-        return Err(error("Add-on already exists; enable it from Add-ons"));
-    }
+    let installed = target.symlink_metadata().is_ok();
     let space = installation::free_bytes(base)?.saturating_sub(2 * 1024 * 1024);
     if space == 0 {
         return Err(error("Not enough disk space for add-on"));
@@ -287,11 +327,73 @@ fn install_verified(
     let stage = Temporary::new(base, "addon-install")?;
     let payload = extract(addon, archive, &stage.0, space)?;
     validate_manifest(addon, &payload)?;
+    if installed
+        && fs::read(target.join("manifest.json")).ok()
+            == Some(fs::read(payload.join("manifest.json"))?)
+        && validate_manifest(addon, &target).is_ok()
+    {
+        return Ok(Outcome::Current);
+    }
     validate(addon, &payload)?;
-    fs::rename(payload, target)?;
+    if installed {
+        // Running helpers keep their open files, so the old tree can move aside and be deleted.
+        // It stays outside the stage: if neither rename works, it is the only copy left.
+        let previous = base.join(format!(
+            ".{}-previous-{}",
+            addon.directory,
+            uuid::Uuid::new_v4()
+        ));
+        fs::rename(&target, &previous)?;
+        if let Err(e) = rename(&payload, &target) {
+            if let Err(restore) = rename(&previous, &target) {
+                return Err(error(format!(
+                    "{e}; previous add-on kept at {} ({restore})",
+                    previous.display()
+                )));
+            }
+            return Err(e);
+        }
+        let _ = fs::remove_dir_all(previous);
+    } else {
+        fs::rename(payload, &target)?;
+    }
+    fs::File::open(base)?.sync_all()?;
+    Ok(if installed {
+        Outcome::Updated
+    } else {
+        Outcome::Installed
+    })
+}
+pub fn remove(id: &str, base: &Path) -> io::Result<()> {
+    let addon = find(id)?;
+    let _lock = crate::file_lock(&base.join("receiver-state"), "install.lock")
+        .map_err(|_| error("Another installation is running"))?;
+    if let Some(setting) = addon.setting
+        && fs::read_to_string(base.join("receiver-state").join(setting))
+            .is_ok_and(|s| s.trim() == "1")
+    {
+        return Err(error(format!("Disable {} before removing it", addon.name)));
+    }
+    let target = base.join(addon.directory);
+    let legacy = addon.legacy.map(|name| base.join(name));
+    let mut removed = false;
+    if target.symlink_metadata().is_ok() {
+        let stage = Temporary::new(base, "addon-remove")?;
+        fs::rename(&target, stage.0.join(addon.directory))?;
+        removed = true;
+    }
+    if let Some(legacy) = legacy
+        && legacy.symlink_metadata().is_ok()
+    {
+        fs::remove_file(legacy)?;
+        removed = true;
+    }
+    if !removed {
+        return Err(error(format!("{} is not installed", addon.name)));
+    }
     fs::File::open(base)?.sync_all()
 }
-pub fn local(id: &str, base: &Path, archive: &Path, sums: &Path) -> io::Result<()> {
+pub fn local(id: &str, base: &Path, archive: &Path, sums: &Path) -> io::Result<Outcome> {
     let addon = find(id)?;
     let stage = Temporary::new(Path::new("/tmp"), "addon-download")?;
     let copy = stage.0.join(addon.asset);
@@ -326,7 +428,11 @@ struct Asset {
     name: String,
     size: u64,
 }
-pub async fn remote(id: &str, base: &Path, mut progress: impl FnMut(String)) -> io::Result<()> {
+pub async fn remote(
+    id: &str,
+    base: &Path,
+    mut progress: impl FnMut(String),
+) -> io::Result<Outcome> {
     if !cfg!(target_arch = "arm") {
         return Err(error("Install add-ons on the ARM station"));
     }
@@ -415,7 +521,7 @@ pub async fn remote(id: &str, base: &Path, mut progress: impl FnMut(String)) -> 
 
 pub enum Message {
     Progress(String),
-    Finished(io::Result<()>),
+    Finished(io::Result<Outcome>),
 }
 pub struct InstallJob {
     pub id: &'static str,
@@ -561,8 +667,83 @@ mod tests {
         assert!(airplay_available(&dir.0));
         assert!(!dir.0.join("receiver-state/airplay-enabled").exists());
         unchanged(&dir.0);
-        assert!(install_verified(addon, &dir.0, &path, &sums, |_, _| Ok(())).is_err());
+        assert_eq!(
+            install_verified(addon, &dir.0, &path, &sums, |_, _| Ok(())).unwrap(),
+            Outcome::Current
+        );
         assert!(airplay_available(&dir.0));
+    }
+    #[test]
+    fn reinstalling_a_changed_package_replaces_the_previous_tree() {
+        let dir = fixture();
+        let addon = &CATALOG[0];
+        let (path, sums) = archive(&dir.0, false, None);
+        install_verified(addon, &dir.0, &path, &sums, |_, _| Ok(())).unwrap();
+        fs::write(dir.0.join("airplay/bin/nqptp"), b"older binary").unwrap();
+        fs::write(dir.0.join("airplay/stale"), b"previous release").unwrap();
+        assert!(
+            install_verified(addon, &dir.0, &path, &sums, |_, _| Err(error("cannot run"))).is_err()
+        );
+        assert_eq!(
+            fs::read(dir.0.join("airplay/bin/nqptp")).unwrap(),
+            b"older binary"
+        );
+        assert_eq!(
+            install_verified(addon, &dir.0, &path, &sums, |_, _| Ok(())).unwrap(),
+            Outcome::Updated
+        );
+        assert_eq!(
+            fs::read(dir.0.join("airplay/bin/nqptp")).unwrap(),
+            b"binary nqptp"
+        );
+        assert!(!dir.0.join("airplay/stale").exists());
+        unchanged(&dir.0);
+        fs::write(dir.0.join("airplay/bin/nqptp"), b"older binary").unwrap();
+        FAIL_RENAMES.set(true);
+        let result = install_verified(addon, &dir.0, &path, &sums, |_, _| Ok(()));
+        FAIL_RENAMES.set(false);
+        let message = result.unwrap_err().to_string();
+        let kept = fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.to_string_lossy().contains(".airplay-previous-"))
+            .unwrap();
+        assert!(message.contains(&*kept.to_string_lossy()), "{message}");
+        assert_eq!(fs::read(kept.join("bin/nqptp")).unwrap(), b"older binary");
+        assert!(!dir.0.join("airplay").exists());
+    }
+    #[test]
+    fn removal_requires_a_disabled_service_and_clears_legacy_files() {
+        let dir = fixture();
+        let airplay = &CATALOG[0];
+        let (path, sums) = archive(&dir.0, false, None);
+        install_verified(airplay, &dir.0, &path, &sums, |_, _| Ok(())).unwrap();
+        fs::write(dir.0.join("receiver-state/airplay-enabled"), "1\n").unwrap();
+        assert_eq!(
+            remove("airplay", &dir.0).unwrap_err().to_string(),
+            "Disable AirPlay 2 before removing it"
+        );
+        assert!(airplay_available(&dir.0));
+        fs::write(dir.0.join("receiver-state/airplay-enabled"), "0\n").unwrap();
+        remove("airplay", &dir.0).unwrap();
+        assert!(!dir.0.join("airplay").exists());
+        assert!(remove("airplay", &dir.0).is_err());
+        fs::write(dir.0.join("playplay-decoder"), b"legacy").unwrap();
+        fs::set_permissions(
+            dir.0.join("playplay-decoder"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(crate::playplay::available(&dir.0));
+        remove("playplay", &dir.0).unwrap();
+        assert!(!crate::playplay::available(&dir.0));
+        unchanged(&dir.0);
+        assert!(!fs::read_dir(&dir.0).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".addon-remove-")
+        }));
     }
     #[test]
     fn playplay_installation_is_independent_of_airplay_and_receiver_state() {

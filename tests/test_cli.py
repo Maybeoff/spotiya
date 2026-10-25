@@ -22,6 +22,7 @@ class MaintenanceCLI(unittest.TestCase):
             cases = [
                 (["addon", "install", "airplay"], ["--addon-install", "airplay"]),
                 (["addon", "install", "playplay"], ["--addon-install", "playplay"]),
+                (["addon", "remove", "airplay"], ["--addon-remove", "airplay"]),
                 (["addon", "file", "airplay", path, "/tmp/AIRPLAY_SHA256SUMS"], ["--addon-install-file", "airplay", path, "/tmp/AIRPLAY_SHA256SUMS"]),
                 (["doctor"], ["--doctor"]),
                 (["doctor", "report", path], ["--doctor-report", path]),

@@ -56,12 +56,12 @@ def main():
             parser.error(args.command + " needs one value")
         value = args.value
     elif args.command == "addon":
-        if len(args.value) == 2 and args.value[0] == "install":
+        if len(args.value) == 2 and args.value[0] in ("install", "remove"):
             value = args.value[1:]
         elif len(args.value) == 4 and args.value[0] == "file":
             value = args.value[1:]
         else:
-            parser.error("addon accepts: install ID, or file ID REMOTE_ARCHIVE REMOTE_SHA256SUMS")
+            parser.error("addon accepts: install ID, remove ID, or file ID REMOTE_ARCHIVE REMOTE_SHA256SUMS")
     elif args.command == "doctor":
         if not args.value:
             value = []
@@ -107,7 +107,7 @@ def main():
     elif args.command == "update":
         remote_command = "update-file" if len(value) == 2 else ("update-tag" if value else ("update-check" if args.value else "update"))
     elif args.command == "addon":
-        remote_command = "addon-install-file" if len(value) == 3 else "addon-install"
+        remote_command = "addon-install-file" if len(value) == 3 else "addon-" + args.value[0]
     remote = shlex.join([BASE + "/spotiya", "--" + remote_command] + value)
     if interactive:
         columns, rows = shutil.get_terminal_size(fallback=(80, 24))

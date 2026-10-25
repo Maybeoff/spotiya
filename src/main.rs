@@ -285,9 +285,11 @@ fn options() -> Result<Option<Options>, String> {
     let mut install_binary = None;
     let mut addon_install = None;
     let mut addon_files = None;
+    let mut addon_remove = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--addon-install" => addon_install = Some(args.next().ok_or("missing add-on id")?),
+            "--addon-remove" => addon_remove = Some(args.next().ok_or("missing add-on id")?),
             "--addon-install-file" => {
                 addon_install = Some(args.next().ok_or("missing add-on id")?);
                 addon_files = Some((
@@ -414,7 +416,7 @@ fn options() -> Result<Option<Options>, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --addons | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --addon-install ID | --addon-install-file ID ARCHIVE SHA256SUMS\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --airplay on/off | --release | --retry"
+                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --addons | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --addon-install ID | --addon-install-file ID ARCHIVE SHA256SUMS | --addon-remove ID\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --airplay on/off | --release | --retry"
                 );
                 return Ok(None);
             }
@@ -425,6 +427,7 @@ fn options() -> Result<Option<Options>, String> {
         doctor,
         update,
         addon_install.is_some(),
+        addon_remove.is_some(),
         install_root.is_some(),
         profile_select.is_some(),
         profile_list,
@@ -441,26 +444,28 @@ fn options() -> Result<Option<Options>, String> {
         doctor::run(&result.state_dir, doctor_report.as_deref()).map_err(|e| e.to_string())?;
         return Ok(None);
     }
+    if let Some(id) = addon_remove {
+        addons::remove(&id, Path::new(installation::BASE)).map_err(|e| e.to_string())?;
+        println!("Add-on removed.");
+        return Ok(None);
+    }
     if let Some(id) = addon_install {
         let base = Path::new(installation::BASE);
-        if let Some((archive, sums)) = addon_files {
-            addons::local(&id, base, &archive, &sums).map_err(|e| e.to_string())?;
+        let outcome = if let Some((archive, sums)) = addon_files {
+            addons::local(&id, base, &archive, &sums).map_err(|e| e.to_string())?
         } else {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?
                 .block_on(addons::remote(&id, base, |s| println!("{s}")))
-                .map_err(|e| e.to_string())?;
-        }
-        if addons::find(&id)
-            .map_err(|e| e.to_string())?
-            .command
-            .is_none()
-        {
-            println!("Add-on installed; ready on demand.");
+                .map_err(|e| e.to_string())?
+        };
+        let addon = addons::find(&id).map_err(|e| e.to_string())?;
+        if outcome == addons::Outcome::Installed && addon.command.is_some() {
+            println!("{}. Enable it in spotiya addons.", outcome.message(addon));
         } else {
-            println!("Add-on installed. Enable it in spotiya addons.");
+            println!("{}.", outcome.message(addon));
         }
         return Ok(None);
     }
