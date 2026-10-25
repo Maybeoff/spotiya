@@ -6,6 +6,12 @@ Spotify Connect для Яндекс Станций: музыка, голосов
 бинарнике на Rust. Воспроизведение и подключение к Spotify обеспечивает
 [librespot](https://github.com/librespot-org/librespot/tree/v0.8.0).
 
+Изменения Login5 и экспериментальный резервный путь PlayPlay находятся в
+[форке librespot](https://github.com/klockky/librespot/tree/dev).
+Cargo загружает его по точному коммиту из `Cargo.toml`; `Cargo.lock` фиксирует
+зависимости. Все внутренние крейты librespot берутся из одной ревизии форка.
+Описание изменений и проверки: [SPOTIYA.md](https://github.com/klockky/librespot/blob/9caddc80a158c734d852d18437c40dd737790e9a/SPOTIYA.md).
+
 Проект поддерживает **первую Мини (YNDX-0004, `yandexmini`)** с glibc 2.23
 и **Мини 2** с glibc 2.30. Обе используют Buildroot и 32-битный ARM
 userspace. Имя в Spotify берётся из hostname колонки. Для других моделей нужны
@@ -396,7 +402,7 @@ RSS включает страницы бинарника и библиотек, 
 
 ## Сборка
 
-На Linux с x86_64 нужны Rust/rustup, C-компилятор, make, pkg-config, curl, bzip2 и xz.
+На Linux с x86_64 нужны Rust/rustup, Git, C-компилятор, make, pkg-config, curl, bzip2 и xz.
 Для локальных Rust-тестов нужны заголовки ALSA (`libasound2-dev` в Debian/Ubuntu).
 
 ```sh
@@ -421,8 +427,9 @@ ALSA из сборочного sysroot в пакет не включается.
 `SPOTIYA_ALSA_SYSROOT`; CPU — через `SPOTIYA_TARGET_CPU`. Это не гарантирует
 совместимость с другой моделью или Android/bionic.
 
-CI выполняет Rust fmt/clippy/tests, C-тесты с ASan/UBSan, ShellCheck,
-проверку Python launcher, ARM-сборку и создание установочного архива.
+CI проверяет core/audio форка на закреплённой ревизии и выполняет Rust
+fmt/clippy/tests, C-тесты с ASan/UBSan, ShellCheck, проверку Python launcher,
+ARM-сборку и создание установочного архива.
 
 ## Лицензия
 

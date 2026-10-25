@@ -857,7 +857,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         info.title.clear();info.artist.clear();info.album.clear();info.duration_ms=0;
                     },
                     PlayerEvent::Playing{track_id,..}=>{
-                        if let Some(uri)=track_id.to_uri().ok().and_then(|s| voice::playable_track(&s))
+                        if let Some(uri)=voice::playable_track(&track_id.to_uri())
                             && last_track.as_ref()!=Some(&uri) {
                                 let temp=last_track_file.with_extension("new");
                                 if fs::write(&temp,&uri).and_then(|_| fs::rename(&temp,&last_track_file)).is_ok() {

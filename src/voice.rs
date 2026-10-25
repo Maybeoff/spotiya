@@ -311,7 +311,7 @@ pub fn playable_track(text: &str) -> Option<String> {
     use librespot::core::spotify_uri::SpotifyUri;
     let uri = SpotifyUri::from_uri(text.trim()).ok()?;
     match uri {
-        SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => uri.to_uri().ok(),
+        SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => Some(uri.to_uri()),
         _ => None,
     }
 }

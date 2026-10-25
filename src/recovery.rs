@@ -122,7 +122,7 @@ impl Failures {
                     return false;
                 }
                 self.last_request = Some(*play_request_id);
-                self.track = track_id.to_uri().ok();
+                self.track = Some(track_id.to_uri());
                 self.count = self.count.saturating_add(1);
                 self.reason = last_reason();
                 if self.count >= LIMIT {

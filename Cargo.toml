@@ -8,7 +8,7 @@ repository = "https://github.com/klockky/spotiya"
 publish = false
 
 [dependencies]
-librespot = { version = "=0.8.0", default-features = false, features = ["alsa-backend", "with-libmdns", "rustls-tls-webpki-roots"] }
+librespot = { git = "https://github.com/klockky/librespot.git", rev = "9caddc80a158c734d852d18437c40dd737790e9a", version = "=0.8.0", default-features = false, features = ["alsa-backend", "with-libmdns", "rustls-tls-webpki-roots"] }
 log = "0.4"
 env_logger = { version = "0.11", default-features = false }
 alsa = "0.10"
