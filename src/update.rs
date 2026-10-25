@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-const REPO: &str = "klockky/spotiya";
+pub(crate) const REPO: &str = "klockky/spotiya";
 const MAX_ARCHIVE: u64 = 16 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 32 * 1024 * 1024;
 
@@ -47,12 +47,8 @@ pub(crate) fn checksum(text: &str, name: &str) -> io::Result<[u8; 32]> {
     }
     found.ok_or_else(|| error("Archive is missing from SHA256SUMS"))
 }
-fn verify(path: &Path, sums: &str) -> io::Result<()> {
-    let expected = checksum(sums, ASSET)?;
+pub(crate) fn sha256(path: &Path) -> io::Result<[u8; 32]> {
     let mut file = fs::File::open(path)?;
-    if file.metadata()?.len() > MAX_ARCHIVE {
-        return Err(error("Archive exceeds 16 MiB"));
-    }
     let mut hash = Sha256::new();
     let mut buffer = [0; 32768];
     loop {
@@ -62,7 +58,14 @@ fn verify(path: &Path, sums: &str) -> io::Result<()> {
         }
         hash.update(&buffer[..n]);
     }
-    if hash.finalize().as_slice() != expected {
+    Ok(hash.finalize().into())
+}
+fn verify(path: &Path, sums: &str) -> io::Result<()> {
+    let expected = checksum(sums, ASSET)?;
+    if fs::metadata(path)?.len() > MAX_ARCHIVE {
+        return Err(error("Archive exceeds 16 MiB"));
+    }
+    if sha256(path)? != expected {
         return Err(error(
             "Archive SHA256 mismatch; installation was not started",
         ));
@@ -142,21 +145,28 @@ fn extract(archive: &Path, destination: &Path) -> io::Result<PathBuf> {
     }
     Ok(destination.join("spotiya"))
 }
-pub fn local(archive: &Path, sums: &Path) -> io::Result<()> {
-    let text = limited_file(sums, 65536)?;
-    let stage = Temporary::new(Path::new("/tmp"), "spotiya-update")?;
-    // Copy first so a replaced source file cannot change the verified archive.
-    let copy = stage.0.join(ASSET);
-    let mut input = fs::File::open(archive)?.take(MAX_ARCHIVE + 1);
+/// Copies a local archive into a private file first, so replacing the source after
+/// verification cannot change what gets installed.
+pub(crate) fn copy_limited(source: &Path, copy: &Path, limit: u64) -> io::Result<()> {
+    let mut input = fs::File::open(source)?.take(limit + 1);
     let mut output = OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
-        .open(&copy)?;
-    if io::copy(&mut input, &mut output)? > MAX_ARCHIVE {
-        return Err(error("Archive exceeds 16 MiB"));
+        .open(copy)?;
+    if io::copy(&mut input, &mut output)? > limit {
+        return Err(error(format!(
+            "Archive exceeds {} MiB",
+            limit / 1024 / 1024
+        )));
     }
-    drop(output);
+    Ok(())
+}
+pub fn local(archive: &Path, sums: &Path) -> io::Result<()> {
+    let text = limited_file(sums, 65536)?;
+    let stage = Temporary::new(Path::new("/tmp"), "spotiya-update")?;
+    let copy = stage.0.join(ASSET);
+    copy_limited(archive, &copy, MAX_ARCHIVE)?;
     install_verified(&copy, &text, &stage.0, None)
 }
 fn install_verified(
@@ -186,16 +196,60 @@ pub fn limited_file(path: &Path, limit: u64) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|_| error("Invalid UTF-8 file"))
 }
 #[derive(serde::Deserialize)]
-struct Release {
-    tag_name: String,
-    draft: bool,
-    prerelease: bool,
-    assets: Vec<Asset>,
+pub(crate) struct Release {
+    pub tag_name: String,
+    pub draft: bool,
+    pub prerelease: bool,
+    pub assets: Vec<Asset>,
 }
 #[derive(serde::Deserialize)]
-struct Asset {
-    name: String,
-    size: u64,
+pub(crate) struct Asset {
+    pub name: String,
+    pub size: u64,
+}
+impl Release {
+    /// A published asset with this name whose size is within `1..=limit`.
+    pub fn asset(&self, name: &str, limit: u64) -> Option<&Asset> {
+        self.assets
+            .iter()
+            .find(|a| a.name == name && a.size > 0 && a.size <= limit)
+    }
+}
+/// Fetches release metadata for `latest` or `tags/vX.Y.Z`; `None` when GitHub has no such release.
+pub(crate) async fn release(
+    client: &reqwest::Client,
+    endpoint: &str,
+) -> io::Result<Option<Release>> {
+    let url = format!("https://api.github.com/repos/{REPO}/releases/{endpoint}");
+    let mut response = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|_| error("Cannot contact GitHub Releases; check DNS and Internet access"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(error(format!(
+            "GitHub returned HTTP {}; retry later",
+            response.status().as_u16()
+        )));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| error("Release metadata interrupted"))?
+    {
+        if bytes.len() + chunk.len() > 1024 * 1024 {
+            return Err(error("Release metadata is too large"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| error("Invalid GitHub release metadata"))
 }
 pub(crate) fn client() -> io::Result<reqwest::Client> {
     reqwest::Client::builder()
@@ -259,26 +313,16 @@ pub fn remote(check: bool, tag: Option<&str>) -> io::Result<()> {
     tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
         let client = client()?;
         let endpoint = if let Some(tag) = tag { format!("tags/v{}", tag.trim_start_matches('v')) } else { "latest".into() };
-        let url = format!("https://api.github.com/repos/{REPO}/releases/{endpoint}");
-        let response = client.get(url).header("Accept","application/vnd.github+json").send().await.map_err(|_| error("Cannot contact GitHub Releases; check DNS and Internet access"))?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
+        let Some(release) = release(&client, &endpoint).await? else {
             println!("No published {}release found. Installed: {}. Actions artifacts are not releases.", if tag.is_some() { "matching " } else { "stable " }, env!("CARGO_PKG_VERSION"));
             return if check { Ok(()) } else { Err(error("Nothing to install from GitHub Releases")) };
-        }
-        if !response.status().is_success() { return Err(error(format!("GitHub returned HTTP {}; retry later",response.status().as_u16()))); }
-        let mut response = response;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| error("Release metadata interrupted"))? {
-            if bytes.len()+chunk.len() > 1024*1024 { return Err(error("Release metadata is too large")); }
-            bytes.extend_from_slice(&chunk);
-        }
-        let release: Release = serde_json::from_slice(&bytes).map_err(|_| error("Invalid GitHub release metadata"))?;
+        };
         let latest = parse_version(&release.tag_name)?;
         if release.draft || release.prerelease { return Err(error("Only published stable releases can be installed")); }
         if let Some(tag) = tag && latest != parse_version(tag)? { return Err(error("GitHub returned a different release")); }
         println!("Installed: {}. Release: {}.",env!("CARGO_PKG_VERSION"),release.tag_name);
-        let archive_asset = release.assets.iter().find(|a| a.name == ASSET).ok_or_else(|| error("Release has no ARMv7 archive"))?;
-        if archive_asset.size == 0 || archive_asset.size > MAX_ARCHIVE || !release.assets.iter().any(|a| a.name == "SHA256SUMS" && a.size <= 65536) { return Err(error("Release assets are missing or exceed size limits")); }
+        if !release.assets.iter().any(|a| a.name == ASSET) { return Err(error("Release has no ARMv7 archive")); }
+        let (Some(archive_asset), Some(_)) = (release.asset(ASSET, MAX_ARCHIVE), release.asset("SHA256SUMS", 65536)) else { return Err(error("Release assets are missing or exceed size limits")); };
         let current = parse_version(env!("CARGO_PKG_VERSION"))?;
         if check { println!("{}",if latest > current { "An update is available." } else { "No newer release." }); return Ok(()); }
         if latest <= current { println!("No newer release; installation skipped."); return Ok(()); }

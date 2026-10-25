@@ -4,7 +4,6 @@ use crate::{
     update,
 };
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
@@ -118,19 +117,6 @@ struct Manifest {
     spotiya_version: String,
     files: BTreeMap<String, String>,
 }
-fn digest(path: &Path) -> io::Result<[u8; 32]> {
-    let mut input = fs::File::open(path)?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0; 32768];
-    loop {
-        let n = input.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buffer[..n]);
-    }
-    Ok(hash.finalize().into())
-}
 fn allowed(addon: &Addon, path: &Path) -> bool {
     let Some(p) = path.to_str() else {
         return false;
@@ -222,7 +208,7 @@ fn validate_manifest(addon: &Addon, payload: &Path) -> io::Result<()> {
             .ok_or_else(|| error("Incomplete add-on manifest"))?;
         let sum = update::checksum(&format!("{expected}  {path}"), &path)?;
         let file = payload.join(&path);
-        if digest(&file)? != sum {
+        if update::sha256(&file)? != sum {
             return Err(error("Add-on binary SHA256 mismatch"));
         }
         fs::set_permissions(file, fs::Permissions::from_mode(0o755))?;
@@ -316,7 +302,7 @@ fn install_verified(
     if fs::metadata(archive)?.len() > MAX_ARCHIVE {
         return Err(error("Add-on archive exceeds 16 MiB"));
     }
-    if digest(archive)? != update::checksum(sums, addon.asset)? {
+    if update::sha256(archive)? != update::checksum(sums, addon.asset)? {
         return Err(error("Add-on archive SHA256 mismatch"));
     }
     let _lock = crate::file_lock(&base.join("receiver-state"), "install.lock")
@@ -400,16 +386,7 @@ pub fn local(id: &str, base: &Path, archive: &Path, sums: &Path) -> io::Result<O
     let addon = find(id)?;
     let stage = Temporary::new(Path::new("/tmp"), "addon-download")?;
     let copy = stage.0.join(addon.asset);
-    let mut input = fs::File::open(archive)?.take(MAX_ARCHIVE + 1);
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&copy)?;
-    if io::copy(&mut input, &mut output)? > MAX_ARCHIVE {
-        return Err(error("Add-on archive exceeds 16 MiB"));
-    }
-    drop(output);
+    update::copy_limited(archive, &copy, MAX_ARCHIVE)?;
     install_verified(
         addon,
         base,
@@ -419,18 +396,6 @@ pub fn local(id: &str, base: &Path, archive: &Path, sums: &Path) -> io::Result<O
     )
 }
 
-#[derive(Deserialize)]
-struct Release {
-    tag_name: String,
-    draft: bool,
-    prerelease: bool,
-    assets: Vec<Asset>,
-}
-#[derive(Deserialize)]
-struct Asset {
-    name: String,
-    size: u64,
-}
 pub async fn remote(
     id: &str,
     base: &Path,
@@ -452,35 +417,22 @@ pub async fn remote(
     if installation::free_bytes(&stage.0)? < MAX_ARCHIVE + 2 * 1024 * 1024 {
         return Err(error("Not enough temporary space"));
     }
-    let metadata = stage.0.join("release.json");
-    let url = format!("https://api.github.com/repos/klockky/spotiya/releases/tags/{tag}");
-    update::download_progress(&client, &url, &metadata, 1024 * 1024, |_, _| {})
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("HTTP 404") {
-                error(format!("No published add-ons for {tag} yet"))
-            } else {
-                e
-            }
-        })?;
-    let release: Release = serde_json::from_str(&update::limited_file(&metadata, 1024 * 1024)?)
-        .map_err(|_| error("Invalid GitHub release metadata"))?;
+    let release = update::release(&client, &format!("tags/{tag}"))
+        .await?
+        .ok_or_else(|| error(format!("No published add-ons for {tag} yet")))?;
     if release.draft || release.prerelease || release.tag_name != tag {
         return Err(error("Release does not match this Spotiya version"));
     }
     let archive = release
-        .assets
-        .iter()
-        .find(|a| a.name == addon.asset && a.size > 0 && a.size <= MAX_ARCHIVE)
+        .asset(addon.asset, MAX_ARCHIVE)
         .ok_or_else(|| error("This release has no compatible add-on package"))?;
-    if !release
-        .assets
-        .iter()
-        .any(|a| a.name == addon.sums && a.size > 0 && a.size <= 65536)
-    {
+    if release.asset(addon.sums, 65536).is_none() {
         return Err(error("Release is missing add-on checksums"));
     }
-    let download = format!("https://github.com/klockky/spotiya/releases/download/{tag}");
+    let download = format!(
+        "https://github.com/{}/releases/download/{tag}",
+        update::REPO
+    );
     let sums = stage.0.join(addon.sums);
     update::download_progress(
         &client,
@@ -582,6 +534,7 @@ impl Drop for InstallJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     fn fixture() -> Temporary {
         let dir = Temporary::new(&std::env::temp_dir(), "addon-test").unwrap();
         fs::create_dir(dir.0.join("receiver-state")).unwrap();
