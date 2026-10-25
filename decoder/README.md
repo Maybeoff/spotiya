@@ -48,6 +48,18 @@ DECODER_PYTHON="$PWD/.cache/decoder-venv/bin/python" \
   scripts/build-playplay.sh /путь/к/Spotify.apk armv7
 ```
 
+Адреса функций библиотеки, которые `decoder.c` перехватывает или вызывает, названы в
+`decoder/check_addresses.py`. Сам `decoder.c` закреплён по контрольной сумме, поэтому
+адреса остаются в нём числами. Проверка по APK:
+
+```sh
+python3 decoder/check_addresses.py /путь/к/Spotify.apk
+```
+
+Без аргумента скрипт только проверяет, что в таблице есть каждый адрес из `decoder.c`;
+это делает и CI. Полный тест с APK: `SPOTIYA_SPOTIFY_APK=/путь/к/Spotify.apk
+python3 -m unittest tests.test_decoder_addresses`.
+
 Результат — `dist/playplay-decoder-armv7`. На проверенной сборке ARMv7 размер
 составляет 1 097 148 байт; результат может меняться с инструментами сборки.
 Вариант для проверки на ПК: заменить `armv7` на `host`.

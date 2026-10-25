@@ -70,7 +70,7 @@ jobs:
           cargo test --locked --manifest-path .cache/librespot/Cargo.toml -p librespot-core -p librespot-audio -p librespot-discovery --no-default-features --features librespot-core/rustls-tls-webpki-roots,librespot-audio/rustls-tls-webpki-roots,librespot-discovery/rustls-tls-webpki-roots --lib
       - run: make -C controls/mini2 check
       - run: shellcheck install.sh scripts/*.sh packaging/*.sh packaging/S99spotify-connect
-      - run: python3 -m py_compile bin/spotiya decoder/prepare.py decoder/package.py airplay/build.py airplay/fetch.py airplay/package.py
+      - run: python3 -m py_compile bin/spotiya decoder/prepare.py decoder/package.py decoder/check_addresses.py airplay/build.py airplay/fetch.py airplay/package.py
       - run: python3 -m unittest discover -s tests -p 'test_*.py'
 
   arm:
