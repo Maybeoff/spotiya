@@ -652,12 +652,13 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let cache = Cache::new(Some(&options.state_dir), None, None, None)?;
     let mut config = SessionConfig::default();
     let id_file = options.state_dir.join("device-id");
-    if let Ok(id) = fs::read_to_string(&id_file) {
-        if !id.trim().is_empty() {
-            config.device_id = id.trim().to_owned();
+    match fs::read_to_string(&id_file) {
+        Ok(id) if !id.trim().is_empty() => config.device_id = id.trim().to_owned(),
+        _ => {
+            // An empty file left by a power cut would otherwise give a new device on every start.
+            let temp = id_file.with_extension("new");
+            fs::write(&temp, &config.device_id).and_then(|_| fs::rename(&temp, &id_file))?;
         }
-    } else {
-        fs::write(&id_file, &config.device_id)?;
     }
     config.tmp_dir = "/tmp/spotiya".into();
     fs::create_dir_all(&config.tmp_dir)?;
@@ -779,6 +780,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let mut credentials = cache.credentials();
+    // Credentials that worked before a pending login, restored if the new account cannot connect.
+    let mut fallback = None;
     let mut spirc: Option<Spirc> = None;
     let mut task: Option<JoinHandle<()>> = None;
     let mut connecting: Option<Connecting> = None;
@@ -846,6 +849,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 let Some(fresh)=fresh else { eprintln!("receiver: discovery stopped"); break; };
                 audio_guard.set_playing(false);connecting=None;voice_epoch+=1;
                 if let Some(reply)=pending_login.take(){let _=reply.send(Err("Login was replaced by another Spotify device"));}
+                fallback=None;
                 stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
                 failures.reset();retry_track=None;
                 credentials=Some(fresh); retry_at=Instant::now(); backoff=5;
@@ -853,6 +857,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             Some(login)=login_rx.recv()=>{
                 audio_guard.set_playing(false);connecting=None;voice_epoch+=1;
                 if let Some(reply)=pending_login.take(){let _=reply.send(Err("Login was replaced by a newer login"));}
+                else {fallback=credentials.take();}
                 stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
                 failures.reset();retry_track=None;
                 credentials=Some(login.credentials);pending_login=Some(login.completed);
@@ -874,7 +879,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 connecting=None;
                 match result {
                     Some(Ok((handle,future)))=>{
-                        spirc=Some(handle);task=Some(tokio::spawn(future));backoff=5;eprintln!("receiver: Spotify connected");
+                        spirc=Some(handle);task=Some(tokio::spawn(future));backoff=5;fallback=None;eprintln!("receiver: Spotify connected");
                         if let Some(reply)=pending_login.take(){let _=reply.send(Ok(()));}
                         if let Some(uri)=retry_track.take() && let Some(handle)=spirc.as_ref() {
                             let _=handle.activate();
@@ -883,14 +888,16 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     },
                     Some(Err(e))=>{
-                        if let Some(reply)=pending_login.take(){let _=reply.send(Err("Receiver could not connect the new account"));}
+                        if let Some(reply)=pending_login.take(){let _=reply.send(Err("Receiver could not connect the new account; previous account kept"));}
                         eprintln!("receiver: connect failed ({:?}); discovery remains available",e.kind);
                         if e.kind==librespot::core::error::ErrorKind::Unauthenticated {credentials=None;}
                         session.shutdown(); retry_at=Instant::now()+Duration::from_secs(backoff);backoff=(backoff*2).min(60);
+                        if let Some(previous)=fallback.take() {credentials=Some(previous);retry_at=Instant::now();backoff=5;eprintln!("receiver: previous account restored");}
                     },
                     None=>{
-                        if let Some(reply)=pending_login.take(){let _=reply.send(Err("Receiver connect timed out"));}
+                        if let Some(reply)=pending_login.take(){let _=reply.send(Err("Receiver connect timed out; previous account kept"));}
                         session.shutdown();retry_at=Instant::now()+Duration::from_secs(backoff);backoff=(backoff*2).min(60);eprintln!("receiver: connect timeout");
+                        if let Some(previous)=fallback.take() {credentials=Some(previous);retry_at=Instant::now();backoff=5;eprintln!("receiver: previous account restored");}
                     },
                 }
             },

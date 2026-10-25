@@ -93,8 +93,20 @@ pub async fn serve(
     let listener = UnixListener::bind(voice::CONTROL)?;
     let limit = Arc::new(Semaphore::new(8));
     let login_lock = Arc::new(Mutex::new(()));
+    let mut failing = false;
     loop {
-        let (socket, _) = listener.accept().await?;
+        let socket = match listener.accept().await {
+            Ok((socket, _)) => socket,
+            Err(e) => {
+                // Descriptor exhaustion and similar errors are transient; keep the socket alive.
+                if !std::mem::replace(&mut failing, true) {
+                    eprintln!("voice: control socket accept failed: {e}");
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+        };
+        failing = false;
         let Ok(permit) = limit.clone().try_acquire_owned() else {
             continue;
         };
