@@ -122,7 +122,7 @@ fn allowed(addon: &Addon, path: &Path) -> bool {
     ) || addon.bins.iter().any(|b| p == format!("bin/{b}"))
         || (p.starts_with("licenses/") && path.components().count() == 4)
 }
-fn extract(addon: &Addon, archive: &Path, stage: &Path) -> io::Result<PathBuf> {
+fn extract(addon: &Addon, archive: &Path, stage: &Path, space: u64) -> io::Result<PathBuf> {
     let input = fs::File::open(archive)?;
     let mut tar =
         tar::Archive::new(flate2::read::GzDecoder::new(input).take(MAX_EXPANDED + 1024 * 1024));
@@ -154,6 +154,9 @@ fn extract(addon: &Addon, archive: &Path, stage: &Path) -> io::Result<PathBuf> {
             .ok_or_else(|| error("Add-on size overflow"))?;
         if total > MAX_EXPANDED {
             return Err(error("Expanded add-on exceeds 32 MiB"));
+        }
+        if total > space {
+            return Err(error("Not enough disk space for add-on"));
         }
         let target = stage.join(relative);
         fs::create_dir_all(target.parent().unwrap())?;
@@ -240,11 +243,12 @@ fn install_verified(
     if target.symlink_metadata().is_ok() {
         return Err(error("Add-on already exists; enable it from Add-ons"));
     }
-    if installation::free_bytes(base)? < MAX_EXPANDED + 2 * 1024 * 1024 {
+    let space = installation::free_bytes(base)?.saturating_sub(2 * 1024 * 1024);
+    if space == 0 {
         return Err(error("Not enough disk space for add-on"));
     }
     let stage = Temporary::new(base, "addon-install")?;
-    let payload = extract(addon, archive, &stage.0)?;
+    let payload = extract(addon, archive, &stage.0, space)?;
     validate_manifest(addon, &payload)?;
     validate(addon, &payload)?;
     fs::rename(payload, target)?;
@@ -514,6 +518,33 @@ mod tests {
         assert!(airplay_available(&dir.0));
     }
     #[test]
+    fn extraction_uses_actual_payload_space_and_rejects_a_smaller_budget() {
+        let dir = fixture();
+        let addon = &CATALOG[0];
+        let (path, _) = archive(&dir.0, false, None);
+        let mut archive =
+            tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(&path).unwrap()));
+        let expanded = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().size())
+            .sum::<u64>();
+        assert!(expanded < 1024 * 1024);
+        let enough = Temporary::new(&dir.0, "addon-space").unwrap();
+        let payload = extract(addon, &path, &enough.0, expanded).unwrap();
+        validate_manifest(addon, &payload).unwrap();
+        let short = Temporary::new(&dir.0, "addon-space").unwrap();
+        assert_eq!(
+            extract(addon, &path, &short.0, expanded - 1)
+                .unwrap_err()
+                .to_string(),
+            "Not enough disk space for add-on"
+        );
+        assert!(!dir.0.join("airplay").exists());
+        unchanged(&dir.0);
+    }
+
+    #[test]
     fn corrupt_wrong_version_or_unrunnable_packages_leave_no_installed_payload() {
         let dir = fixture();
         let addon = &CATALOG[0];
@@ -521,7 +552,7 @@ mod tests {
         assert!(install_verified(addon, &dir.0, &path, &sums, |_, _| Ok(())).is_err());
         let (path, sums) = archive(&dir.0, false, None);
         let unpacked = Temporary::new(&dir.0, "addon-inspect").unwrap();
-        let payload = extract(addon, &path, &unpacked.0).unwrap();
+        let payload = extract(addon, &path, &unpacked.0, MAX_EXPANDED).unwrap();
         fs::write(payload.join("bin/shairport-sync"), b"changed binary").unwrap();
         assert!(validate_manifest(addon, &payload).is_err());
         assert!(
