@@ -20,6 +20,7 @@ pub enum Intent {
     Volume(u16),
     Voice(bool),
     Spectrum(bool),
+    Airplay(bool),
     Release,
     Retry,
 }

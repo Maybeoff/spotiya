@@ -71,7 +71,9 @@ fn clock(ms: u32) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> Vec<String> {
-    let state = if status.retry_required {
+    let state = if status.airplay_active {
+        "AIRPLAY 2"
+    } else if status.retry_required {
         "RETRY REQUIRED"
     } else if !status.connected {
         "CONNECTING"
@@ -93,7 +95,9 @@ fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> 
     } else {
         "off"
     };
-    let guard = if status.native_guard {
+    let guard = if status.airplay_active {
+        "AirPlay priority"
+    } else if status.native_guard {
         "Spotify priority"
     } else {
         "idle"
@@ -134,8 +138,27 @@ fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> 
                 "off"
             }
         ),
+        format!(
+            "AirPlay 2: {}{}",
+            if !status.airplay_available {
+                "not installed"
+            } else if !status.airplay_enabled {
+                "off"
+            } else if status.airplay_running {
+                "on"
+            } else {
+                "starting"
+            },
+            if status.airplay_error.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", safe(&status.airplay_error))
+            }
+        ),
         String::new(),
-        safe(if status.title.is_empty() {
+        safe(if status.airplay_active {
+            "AirPlay audio"
+        } else if status.title.is_empty() {
             "No track selected"
         } else {
             &status.title
@@ -151,7 +174,7 @@ fn lines(status: &Status, notice: &str, prompt: Option<&[u8]>, width: usize) -> 
         ),
         String::new(),
         "Space pause/play   n next   p previous   +/- volume".into(),
-        "/ search   l login   v voice   e spectrum on/off".into(),
+        "/ search   l login   v voice   e spectrum on/off   a add-ons".into(),
         "r retry   d device profile   x release to Alice   q quit".into(),
         String::new(),
     ];
@@ -292,17 +315,140 @@ impl ProfileMenu {
         draw_lines(self.lines(height), width, height)
     }
 }
-pub fn run(state_dir: &Path) -> io::Result<()> {
+#[derive(Default)]
+struct AddonMenu {
+    selected: usize,
+    escape: u8,
+    escape_at: Option<Instant>,
+}
+enum AddonAction {
+    Apply,
+    Cancel,
+    StopInstall,
+}
+impl AddonMenu {
+    fn key(&mut self, key: u8) -> Option<AddonAction> {
+        if key == 27 {
+            self.escape = 1;
+            self.escape_at = Some(Instant::now());
+            return None;
+        }
+        if self.escape == 1 && key == b'[' {
+            self.escape = 2;
+            return None;
+        }
+        let key = if self.escape == 2 {
+            self.escape = 0;
+            match key {
+                b'A' => b'k',
+                b'B' => b'j',
+                _ => return None,
+            }
+        } else {
+            key
+        };
+        match key {
+            b'q' => Some(AddonAction::Cancel),
+            b'c' => Some(AddonAction::StopInstall),
+            b'\r' | b'\n' | b'e' => Some(AddonAction::Apply),
+            b'j' => {
+                self.selected = (self.selected + 1) % crate::addons::CATALOG.len();
+                None
+            }
+            b'k' => {
+                self.selected = (self.selected + crate::addons::CATALOG.len() - 1)
+                    % crate::addons::CATALOG.len();
+                None
+            }
+            _ => None,
+        }
+    }
+    fn lines(
+        &self,
+        status: &Status,
+        height: usize,
+        installing: Option<&str>,
+        notice: &str,
+    ) -> Vec<String> {
+        let count = height.saturating_sub(11).max(1);
+        let start = self.selected.saturating_sub(count - 1);
+        let mut out = vec!["SPOTIYA — ADD-ONS".into(), String::new()];
+        for (index, addon) in crate::addons::CATALOG
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(count)
+        {
+            let label = if installing == Some(addon.id) {
+                "Installing"
+            } else {
+                (addon.state)(status).label()
+            };
+            out.push(format!(
+                "{} {}   [{}]",
+                if index == self.selected { ">" } else { " " },
+                addon.name,
+                label
+            ));
+        }
+        let addon = &crate::addons::CATALOG[self.selected];
+        let state = (addon.state)(status);
+        out.push(String::new());
+        out.push(addon.description.into());
+        if installing == Some(addon.id) {
+            out.push("Installation in progress. c: cancel download".into());
+        } else if state.installed {
+            out.push(format!(
+                "Enter: {} {}",
+                if state.enabled { "disable" } else { "enable" },
+                addon.name
+            ));
+        } else {
+            out.push(format!("Enter: download and enable {}", addon.name));
+            out.push(format!(
+                "GitHub Releases: klockky/spotiya v{}",
+                env!("CARGO_PKG_VERSION")
+            ));
+        }
+        if !state.error.is_empty() {
+            out.push(safe(state.error));
+        }
+        out.push("Up/down or j/k: choose   Esc/q: back".into());
+        out.push(String::new());
+        out.extend(notice.lines().map(safe));
+        out
+    }
+    fn draw(&self, status: &Status, installing: Option<&str>, notice: &str) -> io::Result<()> {
+        let (width, height) = size();
+        draw_lines(
+            self.lines(status, height, installing, notice),
+            width,
+            height,
+        )
+    }
+}
+pub fn run(state_dir: &Path, show_addons: bool) -> io::Result<()> {
     use std::io::BufRead;
     let _terminal = Terminal::enter()?;
     let mut status = Status::default();
     let mut notice = "Ready. / searches Spotify; l pairs an account.".to_owned();
     let mut prompt: Option<Vec<u8>> = None;
     let mut profiles: Option<ProfileMenu> = None;
+    let mut addons = show_addons.then(AddonMenu::default);
+    let mut addon_job: Option<crate::addons::InstallJob> = None;
+    let (addon_messages, addon_rx) = mpsc::channel();
+    let mut addon_notice = String::new();
     let (updates, rx) = mpsc::channel::<String>();
     let mut login_socket: Option<std::os::unix::net::UnixStream> = None;
     let mut last_draw = Instant::now() - Duration::from_secs(1);
     loop {
+        if addons.as_ref().is_some_and(|a| {
+            a.escape != 0
+                && a.escape_at
+                    .is_some_and(|at| at.elapsed() > Duration::from_millis(180))
+        }) {
+            addons = None;
+        }
         if profiles
             .as_ref()
             .is_some_and(|p| p.escape != 0 && p.escape_at.elapsed() > Duration::from_millis(180))
@@ -320,8 +466,31 @@ pub fn run(state_dir: &Path) -> io::Result<()> {
             }
             notice = message;
         }
+        while let Ok(message) = addon_rx.try_recv() {
+            match message {
+                crate::addons::Message::Progress(text) => addon_notice = text,
+                crate::addons::Message::Finished(result) => {
+                    if let Some(job) = addon_job.take() {
+                        addon_notice = match result {
+                            Err(e) => e.to_string(),
+                            Ok(()) => {
+                                let addon = crate::addons::find(job.id)?;
+                                match control::request(&format!("{} ON", addon.command)) {
+                                    Ok(_) => format!("{} installed; enabling...", addon.name),
+                                    Err(e) => format!(
+                                        "Installed. Enable it after starting the receiver: {e}"
+                                    ),
+                                }
+                            }
+                        };
+                    }
+                }
+            }
+        }
         if last_draw.elapsed() >= Duration::from_millis(250) {
-            if let Some(menu) = &profiles {
+            if let Some(menu) = &addons {
+                menu.draw(&status, addon_job.as_ref().map(|j| j.id), &addon_notice)?;
+            } else if let Some(menu) = &profiles {
                 menu.draw()?;
             } else {
                 draw(&status, &notice, prompt.as_deref())?;
@@ -336,6 +505,47 @@ pub fn run(state_dir: &Path) -> io::Result<()> {
                     let _ = s.shutdown(std::net::Shutdown::Both);
                 }
                 return Ok(());
+            }
+            if let Some(menu) = addons.as_mut() {
+                match menu.key(key) {
+                    Some(AddonAction::Cancel) => addons = None,
+                    Some(AddonAction::StopInstall) => {
+                        if let Some(job) = &mut addon_job {
+                            job.cancel();
+                            addon_notice = "Cancelling download...".into();
+                        }
+                    }
+                    Some(AddonAction::Apply) => {
+                        let addon = &crate::addons::CATALOG[menu.selected];
+                        if addon_job.is_some() {
+                            addon_notice = "An add-on installation is already running".into();
+                        } else if (addon.state)(&status).installed {
+                            addon_notice = match control::request(&format!(
+                                "{} {}",
+                                addon.command,
+                                if (addon.state)(&status).enabled {
+                                    "OFF"
+                                } else {
+                                    "ON"
+                                }
+                            )) {
+                                Ok(_) => "Command queued".into(),
+                                Err(e) => e.to_string(),
+                            };
+                        } else {
+                            match crate::addons::InstallJob::start(addon, addon_messages.clone()) {
+                                Ok(job) => {
+                                    addon_job = Some(job);
+                                    addon_notice = "Preparing add-on installation...".into();
+                                }
+                                Err(e) => addon_notice = e.to_string(),
+                            }
+                        }
+                    }
+                    None => {}
+                }
+                last_draw = Instant::now() - Duration::from_secs(1);
+                continue;
             }
             if let Some(menu) = profiles.as_mut() {
                 match menu.key(key) {
@@ -417,6 +627,10 @@ pub fn run(state_dir: &Path) -> io::Result<()> {
                         None
                     }
                 }
+                b'a' => {
+                    addons = Some(AddonMenu::default());
+                    None
+                }
                 b'r' => {
                     if status.retry_required && status.retry_after_secs == 0 {
                         Some("RETRY".into())
@@ -487,6 +701,44 @@ pub fn run(state_dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn addons_screen_shows_install_progress_and_service_states() {
+        let mut menu = AddonMenu::default();
+        let mut status = Status::default();
+        let frame = menu.lines(&status, 24, None, "");
+        assert!(frame.iter().any(|s| s == "SPOTIYA — ADD-ONS"));
+        assert!(
+            frame
+                .iter()
+                .any(|s| s.contains("AirPlay 2   [Not installed]"))
+        );
+        assert!(
+            frame
+                .iter()
+                .any(|s| s.contains("Enter: download and enable"))
+        );
+        assert!(matches!(menu.key(b'\n'), Some(AddonAction::Apply)));
+        let frame = menu.lines(&status, 24, Some("airplay"), "Downloading: 45%");
+        assert!(frame.iter().any(|s| s.contains("[Installing]")));
+        assert!(frame.iter().any(|s| s == "Downloading: 45%"));
+        status.airplay_available = true;
+        assert!(
+            menu.lines(&status, 24, None, "")
+                .iter()
+                .any(|s| s.contains("[Off]"))
+        );
+        status.airplay_enabled = true;
+        status.airplay_running = true;
+        let frame = menu.lines(&status, 24, None, "");
+        assert!(frame.iter().any(|s| s.contains("[Running]")));
+        assert!(frame.iter().any(|s| s == "Enter: disable AirPlay 2"));
+        for key in b"\x1b[B" {
+            assert!(menu.key(*key).is_none());
+        }
+        assert_eq!(menu.selected, 0);
+        assert!(matches!(menu.key(b'c'), Some(AddonAction::StopInstall)));
+        assert!(matches!(menu.key(b'q'), Some(AddonAction::Cancel)));
+    }
     #[test]
     fn profile_menu_navigation_scrolls_and_cancel_does_not_save() {
         let root = std::env::temp_dir().join(format!("spotiya-menu-{}", uuid::Uuid::new_v4()));

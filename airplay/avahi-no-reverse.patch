@@ -1,0 +1,8 @@
+--- a/avahi-core/iface.c
++++ b/avahi-core/iface.c
+@@ -76,4 +76,4 @@
+-            if (avahi_server_add_address(m->server, a->entry_group, a->interface->hardware->index, p, 0, NULL, &a->address) < 0) {
++            if (avahi_server_add_address(m->server, a->entry_group, a->interface->hardware->index, p, AVAHI_PUBLISH_NO_REVERSE, NULL, &a->address) < 0) {
+                 if (!m->server->config.disable_publishing || m->server->error != AVAHI_ERR_NOT_PERMITTED) {
+                     /* suppress warning if disable_publishing set as this is expected state */
+                     avahi_log_warn(__FILE__": avahi_server_add_address() failed: %s", avahi_strerror(m->server->error));

@@ -427,3 +427,70 @@ CI выполняет Rust fmt/clippy/tests, C-тесты с ASan/UBSan, ShellCh
 ## Лицензия
 
 [MIT](LICENSE). Librespot распространяется под MIT; системная ALSA — под LGPL.
+
+
+## AirPlay 2
+
+Начиная с 0.9.0 Spotiya может управлять дополнительным приёмником AirPlay 2
+на основе Shairport Sync. Он использует системное имя колонки. В TUI клавиша
+`a` открывает отдельный экран дополнений. Из терминала — `spotiya addons`.
+В нём Enter скачивает отсутствующее дополнение из GitHub Releases и включает его;
+для установленного дополнения Enter включает или выключает службы.
+Отдельные команды — `spotiya airplay on` и
+`spotiya airplay off`. Настройка сохраняется после перезагрузки.
+
+AirPlay устанавливается отдельным пакетом `spotiya-airplay2-armv7.tar.gz`.
+Экран показывает список дополнений, их состояние и ход загрузки. Стрелки или
+`j`/`k` выбирают пункт, `Esc`/`q` возвращают к плееру, `c` отменяет установку.
+Можно вернуться к плееру, пока идёт загрузка; выход из TUI отменяет её.
+Каталог дополнений задаётся в `src/addons.rs`, интерфейс работает со всем списком.
+
+Пакет берётся из релиза **той же версии**, что запущенная Spotiya. Перед установкой
+проверяются SHA-256 архива, манифест и отдельные бинарники. Установка не перезапускает
+Spotify и не копирует файлы AirPlay в основной бинарник. При выключенном AirPlay
+его четыре службы остановлены. Для прямой установки: `spotiya addon install airplay`.
+Без опубликованного релиза с AirPlay экран покажет причину и позволит повторить попытку.
+
+Базовый пакет Spotiya сохраняет прежний размер и работает без него. Внутри
+AirPlay-пакета находятся Shairport Sync, NQPTP, Avahi и приватный D-Bus;
+системный D-Bus и его настройки не меняются. Avahi не публикует обратные
+адресные записи, чтобы не конфликтовать со штатным mDNS станции. Все процессы запускаются и
+останавливаются вместе с приёмником Spotiya. При сбое одного из них стек
+перезапускается с задержкой. Обновление основной Spotiya сохраняет AirPlay-пакет.
+
+Сборка на Linux:
+
+```sh
+scripts/bootstrap-arm.sh
+scripts/build-airplay.sh
+```
+
+Нужны инструменты сборки C/C++, Python 3, CMake, Autoconf, Automake, Libtool,
+gettext, pkg-config, flex, bison, xxd и host-программа `plistutil`.
+Исходники зависимостей закреплены в `airplay/sources.json` с SHA256;
+ревизии Shairport Sync и NQPTP закреплены в `airplay/fetch.py`.
+
+Сначала установите Spotiya 0.9.1 или новее. Затем распакуйте AirPlay-архив **на ПК**,
+скопируйте каталог `spotiya-airplay2` на станцию и запустите установщик:
+
+```sh
+tar -xzf spotiya-airplay2-armv7.tar.gz
+adb -s DEVICE push spotiya-airplay2 /tmp/spotiya-airplay2-install
+adb -s DEVICE shell sh /tmp/spotiya-airplay2-install/install.sh
+adb -s DEVICE shell spotiya airplay on
+```
+
+Выберите системное имя станции в меню AirPlay на iPhone, iPad или Mac в той же
+локальной сети. При начале AirPlay Spotify освобождает аудиовыход. При запуске
+Spotify AirPlay-сессия завершается, а приёмник снова становится доступен.
+Громкость AirPlay меняет общий уровень колонки. `release`/`x` и пауза в TUI
+завершают AirPlay-сессию; продолжение и смена трека управляются на отправителе.
+Спектр на дисплее пока обрабатывает только Spotify.
+
+Лог дополнительных служб: `/tmp/spotiya-airplay.log`. В `spotiya status` есть
+поля `airplay_available`, `airplay_enabled`, `airplay_running`, `airplay_active`
+и `airplay_error`. Отдельная ошибка AirPlay не останавливает Spotify Connect.
+
+Основной пакет собран для ARMv7 hard-float с glibc 2.23 и системной ALSA;
+он подходит для первой Мини и Мини 2. Опциональные AirPlay-компоненты
+необходимо отдельно проверять на конкретной станции.

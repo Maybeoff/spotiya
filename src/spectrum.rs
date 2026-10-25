@@ -156,12 +156,14 @@ pub struct VisualSink {
     analyzing: bool,
     ducking: Arc<crate::ducking::Ducking>,
     gain: crate::ducking::Gain,
+    gate: Arc<crate::airplay::Gate>,
 }
 impl VisualSink {
     pub fn new(
         inner: Box<dyn Sink>,
         spectrum: Arc<Spectrum>,
         ducking: Arc<crate::ducking::Ducking>,
+        gate: Arc<crate::airplay::Gate>,
     ) -> Self {
         Self {
             inner,
@@ -170,6 +172,7 @@ impl VisualSink {
             analyzing: false,
             ducking,
             gain: crate::ducking::Gain::new(),
+            gate,
         }
     }
 }
@@ -178,11 +181,25 @@ impl Sink for VisualSink {
         self.analyzer = Analyzer::new();
         self.spectrum.clear();
         self.analyzing = false;
-        self.inner.start()
+        self.gate.spotify_open.store(true, Ordering::Release);
+        let result = self
+            .gate
+            .reclaim()
+            .map_err(|e| {
+                librespot::playback::audio_backend::SinkError::ConnectionRefused(e.to_string())
+            })
+            .and_then(|()| self.inner.start());
+        if result.is_err() {
+            self.gate.spotify_open.store(false, Ordering::Release);
+        }
+        result?;
+        Ok(())
     }
     fn stop(&mut self) -> SinkResult<()> {
         self.spectrum.clear();
-        self.inner.stop()
+        let result = self.inner.stop();
+        self.gate.spotify_open.store(false, Ordering::Release);
+        result
     }
     fn write(&mut self, mut packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
         let enabled = self.spectrum.enabled();
@@ -199,6 +216,13 @@ impl Sink for VisualSink {
             self.gain.apply(samples, self.ducking.active());
         }
         self.inner.write(packet, converter)
+    }
+}
+
+impl Drop for VisualSink {
+    fn drop(&mut self) {
+        let _ = self.inner.stop();
+        self.gate.spotify_open.store(false, Ordering::Release);
     }
 }
 
@@ -271,6 +295,7 @@ mod tests {
             Box::new(Capture(output.clone())),
             spectrum.clone(),
             Arc::new(crate::ducking::Ducking::new()),
+            Arc::new(crate::airplay::Gate::new()),
         );
         let samples = tone(100.0, false);
         let mut converter = Converter::new(None);
@@ -300,6 +325,7 @@ mod tests {
             Box::new(Capture(output.clone())),
             Arc::new(Spectrum::new(false)),
             ducking.clone(),
+            Arc::new(crate::airplay::Gate::new()),
         );
         let samples = vec![0.5; 10000];
         let pointer = samples.as_ptr();

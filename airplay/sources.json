@@ -1,0 +1,67 @@
+[
+  {
+    "name": "openssl",
+    "url": "https://www.openssl.org/source/openssl-3.5.4.tar.gz",
+    "sha256": "967311f84955316969bdb1d8d4b983718ef42338639c621ec4c34fddef355e99"
+  },
+  {
+    "name": "ffmpeg",
+    "url": "https://ffmpeg.org/releases/ffmpeg-7.1.2.tar.xz",
+    "sha256": "089bc60fb59d6aecc5d994ff530fd0dcb3ee39aa55867849a2bbc4e555f9c304"
+  },
+  {
+    "name": "sodium",
+    "url": "https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz",
+    "sha256": "ebb65ef6ca439333c2bb41a0c1990587288da07f6c7fd07cb3a18cc18d30ce19"
+  },
+  {
+    "name": "plist",
+    "url": "https://github.com/libimobiledevice/libplist/releases/download/2.7.0/libplist-2.7.0.tar.bz2",
+    "sha256": "7ac42301e896b1ebe3c654634780c82baa7cb70df8554e683ff89f7c2643eb8b"
+  },
+  {
+    "name": "config",
+    "url": "https://github.com/hyperrealm/libconfig/releases/download/v1.7.3/libconfig-1.7.3.tar.gz",
+    "sha256": "545166d6cac037744381d1e9cc5a5405094e7bfad16a411699bcff40bbb31ee7"
+  },
+  {
+    "name": "popt",
+    "url": "https://ftp.osuosl.org/pub/rpm/popt/releases/popt-1.x/popt-1.19.tar.gz",
+    "sha256": "c25a4838fc8e4c1c8aacb8bd620edb3084a3d63bf8987fdad3ca2758c63240f9"
+  },
+  {
+    "name": "gpgerror",
+    "url": "https://gnupg.org/ftp/gcrypt/libgpg-error/libgpg-error-1.51.tar.bz2",
+    "sha256": "be0f1b2db6b93eed55369cdf79f19f72750c8c7c39fc20b577e724545427e6b2"
+  },
+  {
+    "name": "gcrypt",
+    "url": "https://gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-1.11.0.tar.bz2",
+    "sha256": "09120c9867ce7f2081d6aaa1775386b98c2f2f246135761aae47d81f58685b9c"
+  },
+  {
+    "name": "uuid",
+    "url": "https://www.kernel.org/pub/linux/utils/util-linux/v2.40/util-linux-2.40.4.tar.xz",
+    "sha256": "5c1daf733b04e9859afdc3bd87cc481180ee0f88b5c0946b16fdec931975fb79"
+  },
+  {
+    "name": "dbus",
+    "url": "https://dbus.freedesktop.org/releases/dbus/dbus-1.14.10.tar.xz",
+    "sha256": "ba1f21d2bd9d339da2d4aa8780c09df32fea87998b73da24f49ab9df1e36a50f"
+  },
+  {
+    "name": "expat",
+    "url": "https://github.com/libexpat/libexpat/releases/download/R_2_7_3/expat-2.7.3.tar.xz",
+    "sha256": "71df8f40706a7bb0a80a5367079ea75d91da4f8c65c58ec59bcdfbf7decdab9f"
+  },
+  {
+    "name": "avahi",
+    "url": "https://github.com/avahi/avahi/releases/download/v0.8/avahi-0.8.tar.gz",
+    "sha256": "060309d7a333d38d951bc27598c677af1796934dbd98e1024e7ad8de798fedda"
+  },
+  {
+    "name": "daemon",
+    "url": "https://0pointer.de/lennart/projects/libdaemon/libdaemon-0.14.tar.gz",
+    "sha256": "fd23eb5f6f986dcc7e708307355ba3289abe03cc381fc47a80bca4a50aa6b834"
+  }
+]

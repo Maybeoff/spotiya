@@ -43,6 +43,8 @@ fn offline_status(config: &Config, message: &str) {
         .and_then(|s| serde_json::from_str::<crate::control::Status>(&s).ok())
         .unwrap_or_default();
     status.active = false;
+    status.airplay_active = false;
+    status.airplay_running = false;
     status.paused = false;
     status.loading = false;
     status.connected = false;

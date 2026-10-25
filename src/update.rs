@@ -25,7 +25,7 @@ pub fn parse_version(text: &str) -> io::Result<[u32; 3]> {
     }
     Ok(result)
 }
-fn checksum(text: &str, name: &str) -> io::Result<[u8; 32]> {
+pub(crate) fn checksum(text: &str, name: &str) -> io::Result<[u8; 32]> {
     let mut found = None;
     for line in text.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
@@ -197,7 +197,7 @@ struct Asset {
     name: String,
     size: u64,
 }
-fn client() -> io::Result<reqwest::Client> {
+pub(crate) fn client() -> io::Result<reqwest::Client> {
     reqwest::Client::builder()
         .https_only(true)
         .user_agent(concat!("spotiya/", env!("CARGO_PKG_VERSION")))
@@ -208,6 +208,15 @@ fn client() -> io::Result<reqwest::Client> {
         .map_err(|_| error("Cannot initialize HTTPS client"))
 }
 async fn download(client: &reqwest::Client, url: &str, path: &Path, limit: u64) -> io::Result<()> {
+    download_progress(client, url, path, limit, |_, _| {}).await
+}
+pub(crate) async fn download_progress(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    limit: u64,
+    mut progress: impl FnMut(u64, Option<u64>),
+) -> io::Result<()> {
     let mut response = client
         .get(url)
         .send()
@@ -222,6 +231,7 @@ async fn download(client: &reqwest::Client, url: &str, path: &Path, limit: u64) 
     if response.content_length().is_some_and(|n| n > limit) {
         return Err(error("Release asset is too large"));
     }
+    let length = response.content_length();
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -238,6 +248,7 @@ async fn download(client: &reqwest::Client, url: &str, path: &Path, limit: u64) 
             return Err(error("Release asset exceeds size limit"));
         }
         file.write_all(&chunk)?;
+        progress(total, length);
     }
     file.sync_all()
 }

@@ -20,6 +20,8 @@ class MaintenanceCLI(unittest.TestCase):
             env = dict(os.environ, PATH=str(directory) + os.pathsep + os.environ["PATH"], SPOTIYA_TEST_LOG=str(log))
             path = "/tmp/report with spaces; $(false).json"
             cases = [
+                (["addon", "install", "airplay"], ["--addon-install", "airplay"]),
+                (["addon", "file", "airplay", path, "/tmp/AIRPLAY_SHA256SUMS"], ["--addon-install-file", "airplay", path, "/tmp/AIRPLAY_SHA256SUMS"]),
                 (["doctor"], ["--doctor"]),
                 (["doctor", "report", path], ["--doctor-report", path]),
                 (["update", "check"], ["--update-check"]),

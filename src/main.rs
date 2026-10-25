@@ -31,6 +31,8 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
 };
+mod addons;
+mod airplay;
 mod audio_guard;
 mod auth;
 mod control;
@@ -61,6 +63,7 @@ struct Shared {
     volume: AtomicU16,
     commands: mpsc::UnboundedSender<Command>,
     spectrum: Arc<spectrum::Spectrum>,
+    airplay: Arc<airplay::Gate>,
     ducking: Arc<ducking::Ducking>,
 }
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
@@ -189,6 +192,20 @@ impl DeviceMixer {
             Ok(((value - min) * 65535 / (max - min)) as u16)
         })
     }
+    fn set_master_volume(&self, value: u16) {
+        if value != self.shared.volume.load(Ordering::Acquire) {
+            self.shared.ducking.volume.spotify_command();
+        }
+        if self.shared.ducking.volume.holding() {
+            self.shared.volume.store(value, Ordering::Release);
+            return;
+        }
+        if let Ok(actual) = self.write(value) {
+            self.shared.volume.store(actual, Ordering::Release);
+        } else {
+            eprintln!("receiver: mixer volume write failed");
+        }
+    }
 }
 impl Mixer for DeviceMixer {
     fn open(config: MixerConfig) -> Result<Self, Error> {
@@ -211,17 +228,8 @@ impl Mixer for DeviceMixer {
             .unwrap_or_else(|_| self.shared.volume.load(Ordering::Relaxed))
     }
     fn set_volume(&self, value: u16) {
-        if value != self.shared.volume.load(Ordering::Acquire) {
-            self.shared.ducking.volume.spotify_command();
-        }
-        if self.shared.ducking.volume.holding() {
-            self.shared.volume.store(value, Ordering::Release);
-            return;
-        }
-        if let Ok(actual) = self.write(value) {
-            self.shared.volume.store(actual, Ordering::Release);
-        } else {
-            eprintln!("receiver: mixer volume write failed");
+        if !self.shared.airplay.active.load(Ordering::Acquire) {
+            self.set_master_volume(value);
         }
     }
 }
@@ -255,8 +263,22 @@ fn options() -> Result<Option<Options>, String> {
     let mut update_file = None;
     let mut install_root = None;
     let mut install_binary = None;
+    let mut addon_install = None;
+    let mut addon_files = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--addon-install" => addon_install = Some(args.next().ok_or("missing add-on id")?),
+            "--addon-install-file" => {
+                addon_install = Some(args.next().ok_or("missing add-on id")?);
+                addon_files = Some((
+                    PathBuf::from(args.next().ok_or("missing archive")?),
+                    PathBuf::from(args.next().ok_or("missing SHA256SUMS")?),
+                ));
+            }
+            "--addons" => {
+                tui::run(&result.state_dir, true).map_err(|e| e.to_string())?;
+                return Ok(None);
+            }
             "--state-dir" => {
                 result.state_dir = args.next().ok_or("missing state directory")?.into()
             }
@@ -298,6 +320,15 @@ fn options() -> Result<Option<Options>, String> {
                     PathBuf::from(args.next().ok_or("missing SHA256SUMS path")?),
                 ));
             }
+            "--airplay-event" => {
+                let kind = args.next().ok_or("missing AirPlay event")?;
+                let volume = args.next();
+                if args.next().is_some() {
+                    return Err("Unexpected AirPlay hook arguments".into());
+                }
+                airplay::hook(&kind, volume.as_deref()).map_err(|e| e.to_string())?;
+                return Ok(None);
+            }
             "--install" => {
                 install_root = Some(PathBuf::from(args.next().ok_or("missing package root")?))
             }
@@ -308,7 +339,7 @@ fn options() -> Result<Option<Options>, String> {
             "--no-buttons" => result.buttons = false,
             "--no-voice" => result.voice = false,
             "--tui" => {
-                tui::run(&result.state_dir).map_err(|e| e.to_string())?;
+                tui::run(&result.state_dir, false).map_err(|e| e.to_string())?;
                 return Ok(None);
             }
             "--login" => {
@@ -327,7 +358,7 @@ fn options() -> Result<Option<Options>, String> {
                 return Err("Pairing connection closed before login completed".into());
             }
             "--play" | "--resume" | "--pause" | "--next" | "--previous" | "--toggle"
-            | "--volume" | "--voice" | "--spectrum" | "--release" | "--retry" => {
+            | "--volume" | "--voice" | "--spectrum" | "--airplay" | "--release" | "--retry" => {
                 let command = match arg.as_str() {
                     "--play" => format!("PLAY {}", args.next().ok_or("missing music query")?),
                     "--resume" => "RESUME".to_owned(),
@@ -363,7 +394,7 @@ fn options() -> Result<Option<Options>, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --release | --retry"
+                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --addons | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --addon-install ID | --addon-install-file ID ARCHIVE SHA256SUMS\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --airplay on/off | --release | --retry"
                 );
                 return Ok(None);
             }
@@ -373,6 +404,7 @@ fn options() -> Result<Option<Options>, String> {
     if [
         doctor,
         update,
+        addon_install.is_some(),
         install_root.is_some(),
         profile_select.is_some(),
         profile_list,
@@ -387,6 +419,21 @@ fn options() -> Result<Option<Options>, String> {
     }
     if doctor {
         doctor::run(&result.state_dir, doctor_report.as_deref()).map_err(|e| e.to_string())?;
+        return Ok(None);
+    }
+    if let Some(id) = addon_install {
+        let base = Path::new(installation::BASE);
+        if let Some((archive, sums)) = addon_files {
+            addons::local(&id, base, &archive, &sums).map_err(|e| e.to_string())?;
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?
+                .block_on(addons::remote(&id, base, |s| println!("{s}")))
+                .map_err(|e| e.to_string())?;
+        }
+        println!("Add-on installed. Enable it in spotiya addons.");
         return Ok(None);
     }
     if update {
@@ -461,9 +508,13 @@ fn publish_status(
     last: &mut Vec<u8>,
     text: &mut Vec<u8>,
 ) {
-    s.paused.store(playback.paused(), Ordering::Relaxed);
-    s.active.store(playback.active(), Ordering::Release);
-    info.loading = playback.loading();
+    let external = s.airplay.active.load(Ordering::Acquire);
+    s.paused
+        .store(!external && playback.paused(), Ordering::Relaxed);
+    s.active
+        .store(external || playback.active(), Ordering::Release);
+    info.airplay_active = external;
+    info.loading = !external && playback.loading();
     info.retry_required = failures.blocked();
     info.retry_after_secs = failures.retry_after();
     info.failed_tracks = failures.count();
@@ -472,7 +523,11 @@ fn publish_status(
     } else {
         playback.error().to_owned()
     };
-    info.position_ms = playback.position_ms().min(info.duration_ms);
+    info.position_ms = if external {
+        0
+    } else {
+        playback.position_ms().min(info.duration_ms)
+    };
     info.active = s.active.load(Ordering::Acquire);
     s.ducking.volume.set_enabled(info.active);
     s.ducking.volume.activity(s.ducking.active());
@@ -594,6 +649,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         volume: AtomicU16::new(0),
         commands,
         spectrum: Arc::new(spectrum::Spectrum::new(spectrum_enabled)),
+        airplay: Arc::new(airplay::Gate::new()),
         ducking: Arc::new(ducking::Ducking::new()),
     });
     let _ = SHARED.set(shared.clone());
@@ -617,6 +673,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     };
     let backend = audio_backend::find(Some("alsa".into())).expect("ALSA compiled");
     let visual = shared.spectrum.clone();
+    let airplay_gate = shared.airplay.clone();
     let ducking = shared.ducking.clone();
     let audio_device = profile.audio.device.clone();
     let audio_format = profile
@@ -633,6 +690,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 backend(Some(audio_device), audio_format),
                 visual.clone(),
                 ducking.clone(),
+                airplay_gate.clone(),
             ))
         },
     );
@@ -647,8 +705,9 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     });
     let (login_tx, mut login_rx) = mpsc::channel::<auth::Login>(1);
     let control_config = config.clone();
+    let (airplay_tx, mut airplay_rx) = mpsc::channel::<airplay::Request>(8);
     let voice_control = tokio::spawn(async move {
-        if control::serve(voice_tx, login_tx, control_config, caps)
+        if control::serve(voice_tx, login_tx, control_config, caps, airplay_tx)
             .await
             .is_err()
         {
@@ -706,6 +765,14 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         spectrum_supported,
         ..Default::default()
     };
+    let base = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| io::Error::other("No install directory"))?
+        .to_path_buf();
+    let mut airplay =
+        airplay::Runtime::new(&base, &options.state_dir, &options.name, &profile.audio);
+    airplay.poll(&shared.airplay).await;
+    airplay.status(&mut info, &shared.airplay);
     let mut playback = playback::Playback::default();
     let mut failures = recovery::Failures::default();
     let mut retry_track = None::<String>;
@@ -730,6 +797,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 let Some(fresh)=fresh else { eprintln!("receiver: discovery stopped"); break; };
                 audio_guard.set_playing(false);
                 stop_connection(&mut spirc,&mut task,&session,&shared,&mut playback).await;
+                failures.reset();retry_track=None;
                 credentials=Some(fresh); retry_at=Instant::now(); backoff=5;
             },
             Some(login)=login_rx.recv()=>{
@@ -809,8 +877,41 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                     _=>{},
                 }
             },
+            Some(request)=airplay_rx.recv()=>{
+                let accepted = if request.reply.is_closed() || !airplay.valid(&request.token) { false } else {
+                    match request.action {
+                        airplay::Action::Begin => {
+                            shared.airplay.active.store(true,Ordering::Release);
+                            if let Some(handle)=spirc.as_ref(){let _=handle.disconnect(true);}
+                            player.stop();playback.reset();
+                            let deadline=Instant::now()+Duration::from_millis(1500);
+                            while shared.airplay.spotify_open.load(Ordering::Acquire) && Instant::now()<deadline {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                            let accepted=shared.airplay.active.load(Ordering::Acquire) && !shared.airplay.spotify_open.load(Ordering::Acquire);
+                            if accepted {
+                                if let Some(address)=native {let _=voice::pause_native(address).await;}
+                                info.title.clear();info.artist.clear();info.album.clear();info.duration_ms=0;
+                            } else {airplay.stop(&shared.airplay).await;}
+                            accepted
+                        },
+                        airplay::Action::End=>{shared.airplay.active.store(false,Ordering::Release);true},
+                        airplay::Action::Volume(value)=>{
+                            if shared.airplay.active.load(Ordering::Acquire){mixer.set_master_volume(from_percent(value));}
+                            true
+                        },
+                    }
+                };
+                let _=request.reply.send(accepted);
+            },
             Some(command)=command_rx.recv()=>{
-                let ok=if let Some(handle)=spirc.as_ref().filter(|_| shared.active.load(Ordering::Acquire)) {
+                let ok=if shared.airplay.active.load(Ordering::Acquire) {
+                    if command.action==0 {airplay.stop(&shared.airplay).await;true}
+                    else if matches!(command.action,3|4){
+                        let target=(percent(mixer.volume()) as i32+if command.action==3{5}else{-5}).clamp(0,100) as u16;
+                        mixer.set_master_volume(from_percent(target));true
+                    } else {false}
+                } else if let Some(handle)=spirc.as_ref().filter(|_| shared.active.load(Ordering::Acquire)) {
                     match command.action {
                         0=>handle.play_pause().is_ok(),
                         1=>handle.next().is_ok(),
@@ -818,7 +919,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         3|4=>{
                             let old=percent(mixer.volume()) as i32;
                             let target=(old+if command.action==3 {5}else{-5}).clamp(0,100) as u16;
-                            mixer.set_volume(from_percent(target));
+                            mixer.set_master_volume(from_percent(target));
                             handle.set_volume(mixer.volume()).is_ok()
                         },
                         _=>false,
@@ -830,6 +931,13 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 if event.received.elapsed()>Duration::from_secs(5) {continue;}
                 if event.from_voice && !voice_enabled {continue;}
                 let intent=match event.intent {
+                    voice::Intent::Airplay(enabled)=>{
+                        if let Err(e)=airplay.set_enabled(enabled){eprintln!("airplay: {e}");}
+                        airplay.poll(&shared.airplay).await;
+                        airplay.status(&mut info,&shared.airplay);
+                        publish_status(&shared,&playback,&failures,&mut info,&mut last_status,&mut status_buffer);
+                        continue;
+                    },
                     voice::Intent::Retry=>{
                         if let Some(uri)=failures.retry() {
                             retry_track=Some(uri);retry_at=Instant::now();backoff=5;
@@ -855,11 +963,12 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     },
                     voice::Intent::Volume(volume)=>{
-                        mixer.set_volume(from_percent(volume));
+                        mixer.set_master_volume(from_percent(volume));
                         if let Some(handle)=spirc.as_ref(){let _=handle.set_volume(mixer.volume());}
                         continue;
                     },
                     voice::Intent::Release=>{
+                        if shared.airplay.active.load(Ordering::Acquire) {airplay.stop(&shared.airplay).await;}
                         if let Some(handle)=spirc.as_ref(){let _=handle.disconnect(true);}
                         playback.reset();shared.paused.store(false,Ordering::Relaxed);
                         shared.active.store(false,Ordering::Release);audio_guard.set_playing(false);
@@ -868,6 +977,14 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                     voice::Intent::Toggle=>if shared.active.load(Ordering::Acquire)&&!shared.paused.load(Ordering::Relaxed){voice::Intent::Pause}else{voice::Intent::Resume},
                     intent=>intent,
                 };
+                if shared.airplay.active.load(Ordering::Acquire) {
+                    if matches!(intent,voice::Intent::Pause|voice::Intent::Toggle) {
+                        airplay.stop(&shared.airplay).await;
+                        continue;
+                    }
+                    if matches!(intent,voice::Intent::Play(_)|voice::Intent::Resume) {airplay.stop(&shared.airplay).await;}
+                    else {continue;}
+                }
                 if failures.blocked() {continue;}
                 let Some(handle)=spirc.as_ref() else {eprintln!("voice: Spotify is not connected yet");continue;};
                 match intent {
@@ -898,12 +1015,14 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             _=tick.tick()=>{
+                airplay.poll(&shared.airplay).await;
+                airplay.status(&mut info,&shared.airplay);
                 if !playback.playing() && Instant::now() >= reclaim_at {
                     unsafe { libc::malloc_trim(0); }
                     reclaim_at=Instant::now()+Duration::from_secs(30);
                 }
                 let guard=&shared.ducking.volume;
-                guard.set_enabled(playback.active());guard.activity(shared.ducking.active());
+                guard.set_enabled(playback.active() || shared.airplay.active.load(Ordering::Acquire));guard.activity(shared.ducking.active());
                 if let Ok(value)=mixer.read() {
                     if guard.holding() {
                         let desired=shared.volume.load(Ordering::Acquire);
@@ -922,7 +1041,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 if player.is_invalid() {eprintln!("receiver: audio worker stopped");break;}
             },
         }
-        let playing = playback.playing();
+        let playing = playback.playing() || shared.airplay.active.load(Ordering::Acquire);
         audio_guard.set_playing(playing);
         info.connected = spirc.is_some();
         info.native_guard = playing && audio_guard.healthy();
@@ -935,6 +1054,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             &mut status_buffer,
         );
     }
+    airplay.stop(&shared.airplay).await;
     shared.active.store(false, Ordering::Release);
     shared.running.store(false, Ordering::Release);
     if let Some(worker) = voice_watch {
@@ -990,6 +1110,7 @@ mod tests {
             volume: AtomicU16::new(from_percent(37)),
             commands,
             spectrum: Arc::new(spectrum::Spectrum::new(false)),
+            airplay: Arc::new(airplay::Gate::new()),
             ducking: Arc::new(ducking::Ducking::new()),
         });
         assert!(SHARED.set(shared.clone()).is_ok());

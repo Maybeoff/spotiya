@@ -2,6 +2,14 @@
 set -eu
 SPOTIYA_BASE=/data/opt/spotify-connect
 case "${1:-tui}" in
+    addon)
+        shift
+        if [ "$#" -eq 2 ] && [ "$1" = install ]; then
+            set -- --addon-install "$2"
+        elif [ "$#" -eq 4 ] && [ "$1" = file ]; then
+            set -- --addon-install-file "$2" "$3" "$4"
+        else echo 'Usage: spotiya addon install ID | spotiya addon file ID ARCHIVE SHA256SUMS' >&2; exit 1; fi
+        ;;
     start|stop|restart)
         exec /etc/init.d/S99spotify-connect "$1"
         ;;
@@ -36,14 +44,14 @@ case "${1:-tui}" in
             set -- --profile-info
         fi
         ;;
-    tui|login|status|pause|resume|toggle|next|previous|volume|voice|spectrum|retry|release|version|help|profiles)
+    tui|addons|login|status|pause|resume|toggle|next|previous|volume|voice|spectrum|airplay|retry|release|version|help|profiles)
         SPOTIYA_COMMAND=${1:-tui}
         [ "$#" -eq 0 ] || shift
         set -- "--$SPOTIYA_COMMAND" "$@"
         ;;
 esac
 case "${1:-}" in
-    --tui|--login|--play|--pause|--resume|--toggle|--next|--previous|--volume|--voice|--spectrum|--retry|--release)
+    --tui|--addons|--login|--play|--pause|--resume|--toggle|--next|--previous|--volume|--voice|--spectrum|--airplay|--retry|--release)
         "$SPOTIYA_BASE/start.sh" >/dev/null
         ;;
 esac

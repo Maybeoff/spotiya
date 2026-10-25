@@ -22,6 +22,11 @@ pub const STATUS: &str = "/run/spotiya.status";
 #[serde(default)]
 pub struct Status {
     pub active: bool,
+    pub airplay_available: bool,
+    pub airplay_enabled: bool,
+    pub airplay_running: bool,
+    pub airplay_active: bool,
+    pub airplay_error: String,
     pub paused: bool,
     pub loading: bool,
     pub error: String,
@@ -57,6 +62,8 @@ pub fn parse(line: &str) -> Option<Intent> {
         "VOICE OFF" => Some(Intent::Voice(false)),
         "SPECTRUM ON" => Some(Intent::Spectrum(true)),
         "SPECTRUM OFF" => Some(Intent::Spectrum(false)),
+        "AIRPLAY ON" => Some(Intent::Airplay(true)),
+        "AIRPLAY OFF" => Some(Intent::Airplay(false)),
         "RETRY" => Some(Intent::Retry),
         "RELEASE" => Some(Intent::Release),
         s => {
@@ -79,6 +86,7 @@ pub async fn serve(
     logins: mpsc::Sender<auth::Login>,
     config: SessionConfig,
     capabilities: crate::profiles::Capabilities,
+    airplay: mpsc::Sender<crate::airplay::Request>,
 ) -> io::Result<()> {
     let _ = fs::remove_file(voice::CONTROL);
     let listener = UnixListener::bind(voice::CONTROL)?;
@@ -92,6 +100,7 @@ pub async fn serve(
         let sender = sender.clone();
         let logins = logins.clone();
         let config = config.clone();
+        let airplay = airplay.clone();
         let login_lock = login_lock.clone();
         tokio::spawn(async move {
             let _permit = permit;
@@ -110,14 +119,39 @@ pub async fn serve(
                 auth::serve(r, w, login_lock, config, logins).await;
                 return;
             }
-            let reply = if line.trim() == "STATUS" {
+            let reply = if let Some((action, token)) = crate::airplay::parse(&line) {
+                let (reply, result) = tokio::sync::oneshot::channel();
+                if airplay
+                    .try_send(crate::airplay::Request {
+                        action,
+                        token,
+                        reply,
+                    })
+                    .is_ok()
+                    && matches!(
+                        tokio::time::timeout(Duration::from_secs(4), result).await,
+                        Ok(Ok(true))
+                    )
+                {
+                    "OK\n".into()
+                } else {
+                    "ERROR AirPlay handover failed\n".into()
+                }
+            } else if line.trim() == "STATUS" {
                 fs::read_to_string(STATUS).unwrap_or_else(|_| "ERROR Status unavailable\n".into())
             } else if let Some(intent) = parse(&line) {
                 let status = fs::read_to_string(STATUS)
                     .ok()
                     .and_then(|s| serde_json::from_str::<Status>(&s).ok())
                     .unwrap_or_default();
-                if matches!(intent, Intent::Retry)
+                if matches!(intent, Intent::Airplay(true))
+                    && !status.airplay_available
+                    && !crate::addons::airplay_available(std::path::Path::new(
+                        crate::installation::BASE,
+                    ))
+                {
+                    "ERROR Install the optional AirPlay 2 package first\n".into()
+                } else if matches!(intent, Intent::Retry)
                     && (!status.retry_required || status.retry_after_secs > 0)
                 {
                     format!(
