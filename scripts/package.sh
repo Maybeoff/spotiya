@@ -16,5 +16,7 @@ cp packaging/* "$stage/spotiya/packaging/"
 cp scripts/install.sh "$stage/spotiya/scripts/"
 cp bin/spotiya "$stage/spotiya/bin/"
 tar -czf dist/spotiya-armv7-linux-gnueabihf.tar.gz -C "$stage" spotiya
+cp install.sh dist/install.sh
 cd dist
+sha256sum install.sh > INSTALL_SHA256SUMS
 sha256sum spotiya-armv7-linux-gnueabihf.tar.gz > SHA256SUMS

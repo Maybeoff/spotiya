@@ -6,11 +6,32 @@ Spotify Connect для Яндекс Станций: музыка, голосов
 бинарнике на Rust. Воспроизведение и подключение к Spotify обеспечивает
 [librespot](https://github.com/librespot-org/librespot/tree/v0.8.0).
 
-Доработки Login5 и Zeroconf, а также экспериментальный резервный путь PlayPlay
-находятся в [форке librespot](https://github.com/klockky/librespot/tree/dev).
-Cargo загружает его по точному коммиту из `Cargo.toml`; `Cargo.lock` фиксирует
-зависимости. Все внутренние крейты librespot берутся из одной ревизии форка.
-Описание изменений и проверки: [SPOTIYA.md](https://github.com/klockky/librespot/blob/ebacab525375858be6932cbc6c9867d74c957f7a/SPOTIYA.md).
+## Быстрая установка и обновление
+
+В **root-терминале самой колонки** (SSH или `adb shell`) вставьте строку целиком,
+**вместе со скобками**, и нажмите Enter:
+
+```sh
+(set -e; if [ -x /data/opt/spotify-connect/spotiya ]; then echo 'Checking Spotiya updates...'; /data/opt/spotify-connect/spotiya --update; else dir=$(mktemp -d /tmp/spotiya-get.XXXXXX); trap 'rm -rf "$dir"' EXIT; echo 'Downloading Spotiya installer...'; LD_LIBRARY_PATH=/system/vendor/quasar/libs /system/vendor/quasar/maind --gst-launch "souphttpsrc location=https://raw.githubusercontent.com/klockky/spotiya/main/install.sh ssl-strict=true ssl-ca-file=/etc/ssl/certs/ca-certificates.crt iradio-mode=false timeout=15 retries=1 ! filesink location=$dir/install.sh" >"$dir/download.log" 2>&1; if ! grep -Fq 'EOS: end of stream' "$dir/download.log" || grep -Fq 'ERROR from ' "$dir/download.log" || [ ! -s "$dir/install.sh" ]; then echo 'Installer download failed.' >&2; exit 1; fi; sh "$dir/install.sh"; fi)
+```
+
+Одна команда подходит для первой установки и последующих обновлений до последнего
+стабильного [релиза GitHub](https://github.com/klockky/spotiya/releases/latest).
+Вход в аккаунт, настройки, профили и дополнения сохраняются. При первой установке
+добавляются команда `spotiya` и автозапуск; при обновлении сохраняется состояние
+службы. Во время загрузки команда выводит сообщение — дождитесь результата.
+
+После установки откройте интерфейс:
+
+```sh
+spotiya tui
+```
+
+PlayPlay и AirPlay можно установить через `spotiya addons`. Нужны root-доступ и
+Spotify Premium. Быстрый способ проверен на **Мини 2**; для прошивок без подходящего
+`maind --gst-launch` доступна [установка через ПК](#через-пк).
+
+## Поддерживаемые устройства
 
 Проект поддерживает **первую Мини (YNDX-0004, `yandexmini`)** с glibc 2.23
 и **Мини 2** с glibc 2.30. Обе используют Buildroot и 32-битный ARM
@@ -36,9 +57,20 @@ userspace. Имя в Spotify берётся из hostname колонки. Для
 
 ## Установка
 
-Готовые ARMv7-сборки доступны в [артефактах Actions](https://github.com/klockky/spotiya/actions/workflows/ci.yml).
-Публикация тега `v*` также создаёт [GitHub Release](https://github.com/klockky/spotiya/releases)
-с архивом и `SHA256SUMS`.
+Для установки или обновления прямо на колонке используйте [быструю команду](#быстрая-установка-и-обновление)
+в начале README. Если Spotiya уже установлена, достаточно:
+
+```sh
+spotiya update
+```
+
+Команда использует последний стабильный релиз из GitHub Releases. Если версия
+уже актуальна, переустановка и перезапуск приёмника не выполняются.
+
+### Через ПК
+
+Готовые ARMv7-сборки доступны в [GitHub Releases](https://github.com/klockky/spotiya/releases)
+и [артефактах Actions](https://github.com/klockky/spotiya/actions/workflows/ci.yml).
 
 На ПК распакуй архив и передай каталог на колонку:
 
@@ -441,6 +473,13 @@ RSS включает страницы бинарника и библиотек, 
 
 ## Сборка
 
+Доработки Login5 и Zeroconf, а также экспериментальный резервный путь PlayPlay
+находятся в [форке librespot](https://github.com/klockky/librespot/tree/dev).
+Cargo загружает его по точному коммиту из `Cargo.toml`; `Cargo.lock` фиксирует
+зависимости. Все внутренние крейты librespot берутся из одной ревизии форка.
+Описание изменений и проверки: [SPOTIYA.md](https://github.com/klockky/librespot/blob/ebacab525375858be6932cbc6c9867d74c957f7a/SPOTIYA.md).
+
+
 На Linux с x86_64 нужны Rust/rustup, Git, C-компилятор, make, pkg-config, curl, bzip2 и xz.
 Для локальных Rust-тестов нужны заголовки ALSA (`libasound2-dev` в Debian/Ubuntu).
 
@@ -466,7 +505,7 @@ ALSA из сборочного sysroot в пакет не включается.
 `SPOTIYA_ALSA_SYSROOT`; CPU — через `SPOTIYA_TARGET_CPU`. Это не гарантирует
 совместимость с другой моделью или Android/bionic.
 
-CI проверяет core/audio форка на закреплённой ревизии и выполняет Rust
+CI проверяет core/audio/discovery форка на закреплённой ревизии и выполняет Rust
 fmt/clippy/tests, C-тесты с ASan/UBSan, ShellCheck, проверку Python launcher,
 ARM-сборку и создание установочного архива.
 
