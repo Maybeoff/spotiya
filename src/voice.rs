@@ -237,9 +237,12 @@ fn recognized(data: &[u8]) -> Option<(String, String)> {
         return None;
     }
     let state = bytes(data, 252)?;
-    if number(state, 1) != Some(3) {
+    // Quasar marks the phrase final while still LISTENING, about a second before it turns
+    // BUSY. Acting then lets the cancel reach the server before Alice's own reply, such as
+    // a Yandex Plus refusal, which would otherwise be spoken.
+    if !matches!(number(state, 1), Some(1 | 3)) {
         return None;
-    } // final recognition / BUSY
+    }
     let result = bytes(state, 15)?;
     if number(result, 2) != Some(1) || number(result, 4) != Some(1) {
         return None;
@@ -563,7 +566,7 @@ mod tests {
         }
     }
     #[test]
-    fn final_voice_state_only_and_bounded_wire_parser() {
+    fn final_phrase_while_listening_or_busy_and_bounded_wire_parser() {
         let id = b"12345678-1234-1234-1234-123456789012";
         let text = "Включи radiohead".as_bytes();
         let mut asr = Vec::new();
@@ -596,11 +599,27 @@ mod tests {
         ] {
             assert_eq!(recognized(&malformed), None);
         }
-        state[1] = 1;
+        // The same final phrase while still LISTENING is taken a second earlier.
+        let with_state = |alice: u8, asr: &[u8]| {
+            let mut state = Vec::new();
+            put_number(&mut state, 1, u64::from(alice));
+            put_bytes(&mut state, 2, text);
+            put_bytes(&mut state, 7, id);
+            put_bytes(&mut state, 15, asr);
+            let mut msg = Vec::new();
+            put_bytes(&mut msg, 252, &state);
+            put_number(&mut msg, 253, 3);
+            msg
+        };
+        assert!(recognized(&with_state(1, &asr)).is_some());
+        // Partial phrases and other states are ignored.
         let mut partial = Vec::new();
-        put_bytes(&mut partial, 252, &state);
-        put_number(&mut partial, 253, 3);
-        assert_eq!(recognized(&partial), None);
+        put_bytes(&mut partial, 1, text);
+        put_number(&mut partial, 2, 0);
+        put_number(&mut partial, 4, 1);
+        assert_eq!(recognized(&with_state(1, &partial)), None);
+        assert_eq!(recognized(&with_state(2, &asr)), None);
+        assert_eq!(recognized(&with_state(0, &asr)), None);
         assert_eq!(
             &rpc("AliceCapability", 8, &[8, 3])[4..],
             &[
