@@ -59,7 +59,7 @@ parts = shlex.split(sys.argv[2])
 assert "ssl-strict=true" in parts
 assert any(p.startswith("ssl-ca-file=") for p in parts)
 locations = [p.removeprefix("location=") for p in parts if p.startswith("location=")]
-assert locations[0].startswith("https://github.com/klockky/spotiya/releases/latest/download/") or locations[0] == "https://raw.githubusercontent.com/klockky/spotiya/main/install.sh"
+assert locations[0].startswith("https://github.com/klockky/spotiya/releases/latest/download/")
 if os.environ.get("TEST_DOWNLOAD_ERROR") == "1":
     pathlib.Path(locations[1]).write_text('echo unexpected > "$TEST_MARKER"\n')
     print("ERROR from souphttpsrc0: TLS failure")
@@ -79,6 +79,7 @@ except Exception:
         script = script.replace("/etc/ssl/certs/ca-certificates.crt", str(ca))
         self.script = self.directory / "install.sh"
         self.script.write_text(script)
+        (self.directory / "INSTALL_SHA256SUMS").write_text(hashlib.sha256(self.script.read_bytes()).hexdigest() + "  install.sh\n")
         self.env = dict(os.environ, PATH=str(self.commands) + os.pathsep + os.environ["PATH"], TEST_LOG=str(self.log), TEST_BASE=str(self.base), TEST_MARKER=str(self.directory / "unexpected-execution"), TEST_SERVER=f"http://127.0.0.1:{self.server.server_port}")
 
     def fast_command(self):
@@ -134,6 +135,20 @@ except Exception:
         self.assertIn("Installer download failed", result.stderr)
         self.assertFalse((self.directory / "unexpected-execution").exists())
         self.assertFalse(self.base.exists())
+        self.assertEqual(self.calls(), [])
+
+    def test_readme_command_runs_only_the_installer_named_in_the_release_checksums(self):
+        sums = self.directory / "INSTALL_SHA256SUMS"
+        for text in ("0" * 64 + "  install.sh\n", sums.read_text() * 2, sums.read_text().replace("install.sh", "other.sh")):
+            sums.write_text(text)
+            result = self.run_fast()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Installer checksum mismatch", result.stderr)
+            self.assertEqual(self.calls(), [])
+            self.assertFalse(self.base.exists())
+        sums.unlink()
+        result = self.run_fast()
+        self.assertIn("Installer download failed", result.stderr)
         self.assertEqual(self.calls(), [])
 
     def test_failed_update_does_not_fall_back_to_a_fresh_install(self):
