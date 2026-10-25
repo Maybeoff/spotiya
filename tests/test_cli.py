@@ -21,6 +21,7 @@ class MaintenanceCLI(unittest.TestCase):
             path = "/tmp/report with spaces; $(false).json"
             cases = [
                 (["addon", "install", "airplay"], ["--addon-install", "airplay"]),
+                (["addon", "install", "playplay"], ["--addon-install", "playplay"]),
                 (["addon", "file", "airplay", path, "/tmp/AIRPLAY_SHA256SUMS"], ["--addon-install-file", "airplay", path, "/tmp/AIRPLAY_SHA256SUMS"]),
                 (["doctor"], ["--doctor"]),
                 (["doctor", "report", path], ["--doctor-report", path]),

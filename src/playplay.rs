@@ -1,4 +1,8 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use librespot::{
     audio::playplay::PlayPlayDecoder,
@@ -6,17 +10,35 @@ use librespot::{
 };
 use tokio::sync::OnceCell;
 
-pub fn resolver(path: PathBuf) -> Option<PlayPlayResolver> {
-    if !path.is_file() {
-        return None;
-    }
+pub fn decoder_path(base: &Path) -> Option<PathBuf> {
+    [
+        base.join("playplay/bin/playplay-decoder"),
+        base.join("playplay-decoder"),
+    ]
+    .into_iter()
+    .find(|path| {
+        path.metadata()
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    })
+}
+
+pub fn available(base: &Path) -> bool {
+    decoder_path(base).is_some()
+}
+
+pub fn resolver(base: PathBuf) -> PlayPlayResolver {
     let configuration = Arc::new(OnceCell::new());
-    Some(Arc::new(move || {
-        let path = path.clone();
+    Arc::new(move || {
+        let base = base.clone();
         let configuration = configuration.clone();
         Box::pin(async move {
             let config = configuration
                 .get_or_try_init(|| async move {
+                    let path = decoder_path(&base).ok_or_else(|| {
+                        Error::unavailable(
+                            "PlayPlay decoder missing; install PlayPlay from spotiya addons",
+                        )
+                    })?;
                     let config =
                         tokio::task::spawn_blocking(move || PlayPlayDecoder::configuration(&path))
                             .await
@@ -33,7 +55,7 @@ pub fn resolver(path: PathBuf) -> Option<PlayPlayResolver> {
                 .await?;
             Ok(config.clone())
         })
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -56,7 +78,13 @@ mod tests {
             ));
             fs::create_dir(&directory).unwrap();
             fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-            let helper = directory.join("decoder");
+            let fixture = Self(directory);
+            fixture.install(reply);
+            fixture
+        }
+        fn install(&self, reply: bool) {
+            let helper = self.helper();
+            fs::create_dir_all(helper.parent().unwrap()).unwrap();
             let response = if reply {
                 "printf '\\025\\000\\000\\000\\000\\005\\000\\000\\0000123456789abcdef'\n"
             } else {
@@ -70,13 +98,12 @@ mod tests {
             )
             .unwrap();
             fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
-            Self(directory)
         }
         fn helper(&self) -> PathBuf {
-            self.0.join("decoder")
+            self.0.join("playplay/bin/playplay-decoder")
         }
         fn calls(&self) -> usize {
-            fs::read(self.0.join("decoder.count")).map_or(0, |value| value.len())
+            fs::read(self.helper().with_extension("count")).map_or(0, |value| value.len())
         }
     }
     impl Drop for Fixture {
@@ -88,7 +115,7 @@ mod tests {
     #[tokio::test]
     async fn helper_starts_lazily_once_and_configuration_survives_concurrent_callers() {
         let fixture = Fixture::new(true);
-        let resolve = resolver(fixture.helper()).unwrap();
+        let resolve = resolver(fixture.0.clone());
         assert_eq!(fixture.calls(), 0);
         let (first, second) = tokio::join!(resolve(), resolve());
         first.unwrap();
@@ -98,12 +125,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_probe_is_retryable_and_missing_helper_has_no_resolver() {
+    async fn failed_probe_is_retryable() {
         let fixture = Fixture::new(false);
-        let resolve = resolver(fixture.helper()).unwrap();
+        let resolve = resolver(fixture.0.clone());
         assert!(resolve().await.is_err());
         assert!(resolve().await.is_err());
         assert_eq!(fixture.calls(), 2);
-        assert!(resolver(fixture.0.join("missing")).is_none());
+    }
+    #[tokio::test]
+    async fn addon_installed_after_startup_is_used_without_a_restart() {
+        let fixture = Fixture::new(true);
+        fs::remove_file(fixture.helper()).unwrap();
+        let resolve = resolver(fixture.0.clone());
+        assert!(!available(&fixture.0));
+        assert!(
+            resolve()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("spotiya addons")
+        );
+        assert_eq!(fixture.calls(), 0);
+        fixture.install(true);
+        assert!(available(&fixture.0));
+        resolve().await.unwrap();
+        assert_eq!(fixture.calls(), 1);
+    }
+
+    #[test]
+    fn prefers_addon_but_preserves_legacy_manual_installs() {
+        let fixture = Fixture::new(true);
+        let legacy = fixture.0.join("playplay-decoder");
+        fs::copy(fixture.helper(), &legacy).unwrap();
+        assert_eq!(decoder_path(&fixture.0), Some(fixture.helper()));
+        fs::set_permissions(fixture.helper(), fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(decoder_path(&fixture.0), Some(legacy));
     }
 }

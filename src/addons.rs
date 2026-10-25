@@ -27,7 +27,7 @@ pub struct Addon {
     root: &'static str,
     directory: &'static str,
     bins: &'static [&'static str],
-    pub command: &'static str,
+    pub command: Option<&'static str>,
     pub state: fn(&Status) -> State<'_>,
 }
 pub struct State<'a> {
@@ -37,9 +37,11 @@ pub struct State<'a> {
     pub error: &'a str,
 }
 impl State<'_> {
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self, on_demand: bool) -> &'static str {
         if !self.installed {
             "Not installed"
+        } else if on_demand {
+            "Ready (on demand)"
         } else if !self.enabled {
             "Off"
         } else if !self.error.is_empty() {
@@ -51,23 +53,42 @@ impl State<'_> {
         }
     }
 }
-pub static CATALOG: &[Addon] = &[Addon {
-    id: "airplay",
-    name: "AirPlay 2",
-    description: "Receive audio from iPhone, iPad and Mac. Disabled services use no RAM.",
-    asset: "spotiya-airplay2-armv7.tar.gz",
-    sums: "AIRPLAY_SHA256SUMS",
-    root: "spotiya-airplay2",
-    directory: "airplay",
-    bins: AIRPLAY_BINS,
-    command: "AIRPLAY",
-    state: |s| State {
-        installed: s.airplay_available,
-        enabled: s.airplay_enabled,
-        running: s.airplay_running,
-        error: &s.airplay_error,
+pub static CATALOG: &[Addon] = &[
+    Addon {
+        id: "airplay",
+        name: "AirPlay 2",
+        description: "Receive audio from iPhone, iPad and Mac. Disabled services use no RAM.",
+        asset: "spotiya-airplay2-armv7.tar.gz",
+        sums: "AIRPLAY_SHA256SUMS",
+        root: "spotiya-airplay2",
+        directory: "airplay",
+        bins: AIRPLAY_BINS,
+        command: Some("AIRPLAY"),
+        state: |s| State {
+            installed: s.airplay_available,
+            enabled: s.airplay_enabled,
+            running: s.airplay_running,
+            error: &s.airplay_error,
+        },
     },
-}];
+    Addon {
+        id: "playplay",
+        name: "PlayPlay",
+        description: "Optional Spotify decoder. Used automatically only when ordinary audio keys are refused.",
+        asset: "spotiya-playplay-armv7.tar.gz",
+        sums: "PLAYPLAY_SHA256SUMS",
+        root: "spotiya-playplay",
+        directory: "playplay",
+        bins: &["playplay-decoder"],
+        command: None,
+        state: |s| State {
+            installed: s.playplay_available,
+            enabled: true,
+            running: false,
+            error: "",
+        },
+    },
+];
 pub fn find(id: &str) -> io::Result<&'static Addon> {
     CATALOG
         .iter()
@@ -207,7 +228,9 @@ fn validate_binaries(addon: &Addon, payload: &Path) -> io::Result<()> {
         if &header[..6] != b"\x7fELF\x01\x01" || header[18..20] != [40, 0] {
             return Err(error("Add-on requires ARMv7 Linux executables"));
         }
-        let argument = if matches!(*name, "shairport-sync" | "nqptp") {
+        let argument = if *name == "playplay-decoder" {
+            "--info"
+        } else if matches!(*name, "shairport-sync" | "nqptp") {
             "-V"
         } else {
             "--version"
@@ -215,6 +238,20 @@ fn validate_binaries(addon: &Addon, payload: &Path) -> io::Result<()> {
         let result = installation::command(&file, &[argument.as_ref()], Duration::from_secs(5))?;
         if !result.status.success() {
             return Err(error(format!("{name} cannot run on this station")));
+        }
+        if *name == "playplay-decoder" {
+            #[derive(Deserialize)]
+            struct DecoderInfo {
+                protocol_version: u32,
+                network: bool,
+            }
+            let info: DecoderInfo = serde_json::from_slice(&result.stdout)
+                .map_err(|_| error("Invalid PlayPlay decoder information"))?;
+            if info.protocol_version != 1 || info.network {
+                return Err(error("Unsupported PlayPlay decoder protocol"));
+            }
+            librespot::audio::playplay::PlayPlayDecoder::configuration(&file)
+                .map_err(|_| error("PlayPlay decoder configuration check failed"))?;
         }
         if *name == "shairport-sync"
             && !String::from_utf8_lossy(&result.stdout).contains("AirPlay2")
@@ -445,7 +482,14 @@ mod tests {
         bad_manifest: bool,
         extra: Option<(&str, tar::EntryType)>,
     ) -> (PathBuf, String) {
-        let addon = &CATALOG[0];
+        archive_for(&CATALOG[0], root, bad_manifest, extra)
+    }
+    fn archive_for(
+        addon: &Addon,
+        root: &Path,
+        bad_manifest: bool,
+        extra: Option<(&str, tar::EntryType)>,
+    ) -> (PathBuf, String) {
         let path = root.join(addon.asset);
         let mut files = BTreeMap::new();
         let mut hashes = BTreeMap::new();
@@ -455,12 +499,15 @@ mod tests {
                 format!("bin/{name}"),
                 format!("{:x}", Sha256::digest(&data)),
             );
-            files.insert(format!("{}/airplay/bin/{name}", addon.root), data);
+            files.insert(
+                format!("{}/{}/bin/{name}", addon.root, addon.directory),
+                data,
+            );
         }
         let manifest = serde_json::json!({"format":1,"target":"armv7-unknown-linux-gnueabihf",
             "spotiya_version":if bad_manifest {"0.0.0"} else {env!("CARGO_PKG_VERSION")},"files":hashes});
         files.insert(
-            format!("{}/airplay/manifest.json", addon.root),
+            format!("{}/{}/manifest.json", addon.root, addon.directory),
             serde_json::to_vec(&manifest).unwrap(),
         );
         let zip = flate2::write::GzEncoder::new(
@@ -516,6 +563,17 @@ mod tests {
         unchanged(&dir.0);
         assert!(install_verified(addon, &dir.0, &path, &sums, |_, _| Ok(())).is_err());
         assert!(airplay_available(&dir.0));
+    }
+    #[test]
+    fn playplay_installation_is_independent_of_airplay_and_receiver_state() {
+        let dir = fixture();
+        let addon = find("playplay").unwrap();
+        let (path, sums) = archive_for(addon, &dir.0, false, None);
+        install_verified(addon, &dir.0, &path, &sums, |_, _| Ok(())).unwrap();
+        assert!(crate::playplay::available(&dir.0));
+        assert!(!airplay_available(&dir.0));
+        assert!(!dir.0.join("receiver-state/airplay-enabled").exists());
+        unchanged(&dir.0);
     }
     #[test]
     fn extraction_uses_actual_payload_space_and_rejects_a_smaller_budget() {

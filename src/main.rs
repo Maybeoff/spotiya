@@ -434,7 +434,15 @@ fn options() -> Result<Option<Options>, String> {
                 .block_on(addons::remote(&id, base, |s| println!("{s}")))
                 .map_err(|e| e.to_string())?;
         }
-        println!("Add-on installed. Enable it in spotiya addons.");
+        if addons::find(&id)
+            .map_err(|e| e.to_string())?
+            .command
+            .is_none()
+        {
+            println!("Add-on installed; ready on demand.");
+        } else {
+            println!("Add-on installed. Enable it in spotiya addons.");
+        }
         return Ok(None);
     }
     if update {
@@ -770,8 +778,9 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         .parent()
         .ok_or_else(|| io::Error::other("No install directory"))?
         .to_path_buf();
-    let playplay = playplay::resolver(base.join("playplay-decoder"));
-    if playplay.is_some() {
+    let playplay = playplay::resolver(base.clone());
+    info.playplay_available = playplay::available(&base);
+    if info.playplay_available {
         eprintln!("receiver: PlayPlay fallback available (lazy)");
     }
     let mut airplay =
@@ -814,7 +823,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             },
             _=tokio::time::sleep_until(retry_at), if spirc.is_none() && credentials.is_some() && !failures.blocked()=>{
                 session=Session::new(config.clone(),Some(cache.clone()));
-                session.audio_key().set_playplay_resolver(playplay.clone());
+                session.audio_key().set_playplay_resolver(Some(playplay.clone()));
                 player.set_session(session.clone());
                 let connect=ConnectConfig { name:options.name.clone(), initial_volume:mixer.volume(),
                     volume_steps:100, device_type:DeviceType::Speaker, ..Default::default() };
@@ -1049,6 +1058,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
         let playing = playback.playing() || shared.airplay.active.load(Ordering::Acquire);
         audio_guard.set_playing(playing);
+        info.playplay_available = playplay::available(&base);
         info.connected = spirc.is_some();
         info.native_guard = playing && audio_guard.healthy();
         publish_status(

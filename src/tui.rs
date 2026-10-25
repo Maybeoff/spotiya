@@ -382,7 +382,7 @@ impl AddonMenu {
             let label = if installing == Some(addon.id) {
                 "Installing"
             } else {
-                (addon.state)(status).label()
+                (addon.state)(status).label(addon.command.is_none())
             };
             out.push(format!(
                 "{} {}   [{}]",
@@ -397,6 +397,10 @@ impl AddonMenu {
         out.push(addon.description.into());
         if installing == Some(addon.id) {
             out.push("Installation in progress. c: cancel download".into());
+        } else if state.installed && addon.command.is_none() {
+            out.push(
+                "Ready; used automatically when ordinary Spotify audio keys are refused.".into(),
+            );
         } else if state.installed {
             out.push(format!(
                 "Enter: {} {}",
@@ -404,7 +408,15 @@ impl AddonMenu {
                 addon.name
             ));
         } else {
-            out.push(format!("Enter: download and enable {}", addon.name));
+            out.push(format!(
+                "Enter: download{} {}",
+                if addon.command.is_some() {
+                    " and enable"
+                } else {
+                    ""
+                },
+                addon.name
+            ));
             out.push(format!(
                 "GitHub Releases: klockky/spotiya v{}",
                 env!("CARGO_PKG_VERSION")
@@ -475,11 +487,18 @@ pub fn run(state_dir: &Path, show_addons: bool) -> io::Result<()> {
                             Err(e) => e.to_string(),
                             Ok(()) => {
                                 let addon = crate::addons::find(job.id)?;
-                                match control::request(&format!("{} ON", addon.command)) {
-                                    Ok(_) => format!("{} installed; enabling...", addon.name),
-                                    Err(e) => format!(
-                                        "Installed. Enable it after starting the receiver: {e}"
-                                    ),
+                                match addon.command {
+                                    None => format!("{} installed; ready on demand", addon.name),
+                                    Some(command) => {
+                                        match control::request(&format!("{command} ON")) {
+                                            Ok(_) => {
+                                                format!("{} installed; enabling...", addon.name)
+                                            }
+                                            Err(e) => format!(
+                                                "Installed. Enable it after starting the receiver: {e}"
+                                            ),
+                                        }
+                                    }
                                 }
                             }
                         };
@@ -520,17 +539,22 @@ pub fn run(state_dir: &Path, show_addons: bool) -> io::Result<()> {
                         if addon_job.is_some() {
                             addon_notice = "An add-on installation is already running".into();
                         } else if (addon.state)(&status).installed {
-                            addon_notice = match control::request(&format!(
-                                "{} {}",
-                                addon.command,
-                                if (addon.state)(&status).enabled {
-                                    "OFF"
-                                } else {
-                                    "ON"
+                            addon_notice = match addon.command {
+                                None => {
+                                    format!("{} ready; used automatically when needed", addon.name)
                                 }
-                            )) {
-                                Ok(_) => "Command queued".into(),
-                                Err(e) => e.to_string(),
+                                Some(command) => match control::request(&format!(
+                                    "{} {}",
+                                    command,
+                                    if (addon.state)(&status).enabled {
+                                        "OFF"
+                                    } else {
+                                        "ON"
+                                    }
+                                )) {
+                                    Ok(_) => "Command queued".into(),
+                                    Err(e) => e.to_string(),
+                                },
                             };
                         } else {
                             match crate::addons::InstallJob::start(addon, addon_messages.clone()) {
@@ -735,7 +759,22 @@ mod tests {
         for key in b"\x1b[B" {
             assert!(menu.key(*key).is_none());
         }
-        assert_eq!(menu.selected, 0);
+        assert_eq!(menu.selected, 1);
+        let frame = menu.lines(&status, 24, None, "");
+        assert!(frame.iter().any(|s| s.contains("Enter: download PlayPlay")));
+        status.playplay_available = true;
+        let frame = menu.lines(&status, 24, None, "");
+        assert!(
+            frame
+                .iter()
+                .any(|s| s.contains("PlayPlay   [Ready (on demand)]"))
+        );
+        assert!(
+            frame
+                .iter()
+                .any(|s| s.contains("Ready; used automatically"))
+        );
+        assert!(!frame.iter().any(|s| s.contains("Enter: disable PlayPlay")));
         assert!(matches!(menu.key(b'c'), Some(AddonAction::StopInstall)));
         assert!(matches!(menu.key(b'q'), Some(AddonAction::Cancel)));
     }
