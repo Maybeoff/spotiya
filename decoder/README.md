@@ -84,7 +84,9 @@ adb -s SPEAKER_IP:5555 push dist/playplay-decoder-armv7 /tmp/playplay-decoder
 adb -s SPEAKER_IP:5555 shell 'spotiya stop && cp /tmp/playplay-decoder /data/opt/spotify-connect/playplay-decoder && chmod 755 /data/opt/spotify-connect/playplay-decoder && spotiya start'
 ```
 
-После запуска в журнале должно появиться `PlayPlay fallback ready`.
+После запуска приёмника в журнале появляется `PlayPlay fallback available (lazy)`.
+Декодер запускается только после явного отказа обычного аудиоключа;
+при успешном AES, сетевой ошибке или таймауте он не запускается.
 `playplay-decoder --info` показывает размер ресурсов и версию протокола;
 команда не подключается к сети. Декодер не получает токены аккаунта и работает
 через stdin/stdout с родительским процессом. Для отключения остановите Spotiya,

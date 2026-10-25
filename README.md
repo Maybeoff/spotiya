@@ -10,7 +10,7 @@ Spotify Connect для Яндекс Станций: музыка, голосов
 [форке librespot](https://github.com/klockky/librespot/tree/dev).
 Cargo загружает его по точному коммиту из `Cargo.toml`; `Cargo.lock` фиксирует
 зависимости. Все внутренние крейты librespot берутся из одной ревизии форка.
-Описание изменений и проверки: [SPOTIYA.md](https://github.com/klockky/librespot/blob/9caddc80a158c734d852d18437c40dd737790e9a/SPOTIYA.md).
+Описание изменений и проверки: [SPOTIYA.md](https://github.com/klockky/librespot/blob/24f5f12ff2f4103263ed561db222cec03b861504/SPOTIYA.md).
 
 Проект поддерживает **первую Мини (YNDX-0004, `yandexmini`)** с glibc 2.23
 и **Мини 2** с glibc 2.30. Обе используют Buildroot и 32-битный ARM
@@ -63,10 +63,14 @@ adb -s SPEAKER_IP:5555 shell sh /tmp/spotiya/scripts/install.sh
 ### Экспериментальный PlayPlay
 
 Если рядом с `spotiya` установлен совместимый `playplay-decoder`, приёмник
-проверяет его протокол и включает резервное получение ключа через PlayPlay.
+помечает резервный путь как доступный, не запуская декодер. Его протокол и
+параметры проверяются только после первого явного отказа обычного аудиоключа;
+успешный результат сохраняется между сеансами Spotify в памяти приёмника.
 Обычный AES-путь используется первым; PlayPlay запрашивается при явном отказе AP.
-В журнале появляются `PlayPlay fallback ready`, `AP audio key refused; trying PlayPlay`
-и `PlayPlay decoder ready`. Материал ключей и ответы сервера в журнал не выводятся.
+При старте журнал содержит `PlayPlay fallback available (lazy)`. При отказе
+обычного ключа появляются `AP audio key refused; trying PlayPlay`,
+`PlayPlay decoder configured on demand` и `PlayPlay decoder ready`.
+Материал ключей и ответы сервера в журнал не выводятся.
 
 Декодер работает отдельным процессом для каждого загружаемого трека. Чтение и
 перемотка передаются через локальный бинарный канал с ограничением размера и
