@@ -44,7 +44,9 @@ with tempfile.TemporaryDirectory(prefix="airplay-package-",dir=DIST) as scratch:
     shutil.copy2(RECIPE/"sources.json",payload/"sources.json")
     shutil.copy2(RECIPE/"avahi-no-reverse.patch",payload/"avahi-no-reverse.patch")
     import fetch
-    (payload/"revisions.json").write_text(json.dumps(fetch.PROJECTS,indent=2)+"\n")
+    revisions = dict(fetch.PROJECTS)
+    revisions["spotiya_identity"] = {"model": "AudioAccessory5,1", "purpose": "HomePod mini icon; existing AirPlay capabilities retained"}
+    (payload/"revisions.json").write_text(json.dumps(revisions,indent=2)+"\n")
     for name in [*fetch.PROJECTS, *[s["name"] for s in json.loads((RECIPE/"sources.json").read_text())]]:
         for source in (BUILD/name).iterdir():
             if source.is_file() and source.name.upper().startswith(("COPYING","LICENSE","LICENCE")):

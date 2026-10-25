@@ -101,6 +101,15 @@ def build(name):
         run(name, ['./configure', '--host=arm-linux-gnueabihf', '--build=x86_64-pc-linux-gnu', f'--prefix={PREFIX}', '--sysconfdir=/etc', '--without-systemd-startup'])
         run(name, ['make', '-j3'])
     elif name == 'shairport-sync':
+        source = ROOT/'shairport-sync/shairport.c'
+        text = source.read_text()
+        old = 'config.model = strdup("ShairportSync");'
+        new = 'config.model = strdup("AudioAccessory5,1");'
+        if old in text:
+            assert text.count(old) == 1
+            source.write_text(text.replace(old, new))
+        elif not any(line.strip() == new for line in text.splitlines()):
+            raise RuntimeError('Unexpected Shairport model source')
         modern_alsa = ['get_access', 'get_buffer_size', 'get_buffer_time', 'get_channels',
                        'get_format', 'get_period_size', 'get_period_time', 'get_periods',
                        'get_rate', 'get_subformat', 'set_buffer_size_near',
