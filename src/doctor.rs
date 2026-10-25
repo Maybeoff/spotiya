@@ -139,34 +139,62 @@ fn log_summary(source: &'static str, path: &Path) -> io::Result<LogSummary> {
     Ok(LogSummary { source, counts })
 }
 fn category(line: &str) -> Option<&'static str> {
-    let lower = line.to_ascii_lowercase();
-    if lower.contains("audio_key") || lower.contains("audio key") {
-        Some("audio_key")
-    } else if lower.contains("alsa") || lower.contains("audio_backend") {
-        Some("audio_device")
-    } else if lower.contains("decoder") || lower.contains("decoding") {
-        Some("decoder")
-    } else if lower.contains("unauthenticated")
-        || lower.contains("invalid credentials")
-        || lower.contains("access token")
-        || lower.contains("authentication failed")
-    {
-        Some("authentication")
-    } else if lower.contains("http_client")
-        || lower.contains("cdn_url")
-        || lower.contains("network")
-        || lower.contains("timed out")
-        || lower.contains("connection refused")
-    {
-        Some("network")
-    } else if lower.contains("supervisor: child exited") || lower.contains("supervisor: restarting")
-    {
-        Some("receiver_restart")
-    } else if lower.starts_with("[warn ") || lower.starts_with("[error ") {
-        Some("other_warning_or_error")
-    } else {
-        None
+    let lower = line.trim_end().to_ascii_lowercase();
+    // Spotiya's own failure lines; everything else it prints is progress, not an error.
+    if lower.starts_with("receiver: connect failed") {
+        return Some(
+            // Builds before 0.9.4 printed only the error kind, as `PermissionDenied`.
+            if lower.contains("permission denied")
+                || lower.contains("permissiondenied")
+                || lower.contains("unauthenticated")
+                || lower.contains("no valid authentication credentials")
+            {
+                "authentication"
+            } else {
+                "network"
+            },
+        );
     }
+    if lower.starts_with("receiver: connect timeout") {
+        return Some("network");
+    }
+    if lower.starts_with("supervisor: receiver exited") {
+        return Some("receiver_restart");
+    }
+    if lower.starts_with("alsa lib ") {
+        return Some("audio_device");
+    }
+    // librespot logs success at INFO, often naming the decoder or ALSA sink.
+    if !lower.starts_with("[warn ") && !lower.starts_with("[error ") {
+        return None;
+    }
+    Some(
+        if lower.contains("audio_key") || lower.contains("audio key") {
+            "audio_key"
+        } else if lower.contains("alsa") || lower.contains("audio_backend") {
+            "audio_device"
+        } else if lower.contains("decoder") || lower.contains("decoding") {
+            "decoder"
+        } else if lower.contains("unauthenticated")
+            || lower.contains("invalid credentials")
+            || lower.contains("access token")
+            || lower.contains("authentication failed")
+            || lower.contains("login failed")
+        {
+            "authentication"
+        } else if lower.contains("http_client")
+            || lower.contains("cdn_url")
+            || lower.contains("network")
+            || lower.contains("websocket")
+            || lower.contains("connection to server closed")
+            || lower.contains("timed out")
+            || lower.contains("connection refused")
+        {
+            "network"
+        } else {
+            "other_warning_or_error"
+        },
+    )
 }
 fn mixer(audio: &profiles::Audio) -> io::Result<(i64, i64, i64, Option<bool>)> {
     let mixer = alsa::mixer::Mixer::new(&audio.mixer_device, true)
@@ -418,6 +446,67 @@ mod tests {
         }
         assert_eq!(report.logs[0].counts["audio_key"], 1);
         assert_eq!(report.logs[0].counts["network"], 1);
+    }
+    #[test]
+    fn log_categories_count_failures_but_not_progress() {
+        for (line, expected) in [
+            (
+                "receiver: connect failed (Permission denied { Login failed with reason: Bad credentials }); discovery remains available",
+                Some("authentication"),
+            ),
+            (
+                "receiver: connect failed (No valid authentication credentials { token expired }); discovery remains available",
+                Some("authentication"),
+            ),
+            (
+                "receiver: connect failed (Unauthenticated); discovery remains available",
+                Some("authentication"),
+            ),
+            (
+                "receiver: connect failed (PermissionDenied); discovery remains available",
+                Some("authentication"),
+            ),
+            (
+                "[WARN librespot_core::dealer] Websocket connection failed: IO error",
+                Some("network"),
+            ),
+            (
+                "receiver: connect failed (Service unavailable { transport returned no data })",
+                Some("network"),
+            ),
+            (
+                "supervisor: receiver exited (Ok(ExitStatus(unix_wait_status(256)))); retry in 2s",
+                Some("receiver_restart"),
+            ),
+            (
+                "ALSA lib pcm.c:8526:(snd_pcm_recover) underrun occurred",
+                Some("audio_device"),
+            ),
+            (
+                "[WARN librespot_playback::audio_backend::alsa] Error writing from AlsaSink buffer",
+                Some("audio_device"),
+            ),
+            (
+                "[WARN librespot_core::session] Try another access point...",
+                Some("other_warning_or_error"),
+            ),
+            (
+                "[INFO librespot_audio::playplay] PlayPlay decoder ready",
+                None,
+            ),
+            (
+                "[INFO librespot_playback::audio_backend::alsa] Using AlsaSink with format: S16",
+                None,
+            ),
+            (
+                "[INFO librespot_core::playplay] AP audio key refused; trying PlayPlay",
+                None,
+            ),
+            ("receiver: PlayPlay decoder configured on demand", None),
+            ("supervisor: receiver started (pid 31719)", None),
+        ] {
+            assert_eq!(category(line), expected, "{line}");
+        }
     }
     #[test]
     fn saved_reports_are_private_and_existing_files_are_preserved() {
