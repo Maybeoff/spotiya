@@ -19,6 +19,7 @@ const FILES: &[&str] = &[
     "boot.sh",
     "service.sh",
     "cli.sh",
+    "profiles/mini1.json",
     "profiles/mini2.json",
     "profiles/generic.json",
     "S99spotify-connect",
@@ -361,7 +362,8 @@ fn transaction(
         )?;
     }
     let backup = snapshot(layout)?;
-    if running {
+    let had_service = layout.init.exists();
+    if running && had_service {
         service.stop()?;
     }
     let result: io::Result<()> = (|| {
@@ -369,6 +371,9 @@ fn transaction(
             if file == "S99spotify-connect" {
                 copy_atomic(&stage.0.join(file), &layout.destination(file))?;
             } else {
+                if let Some(parent) = layout.destination(file).parent() {
+                    fs::create_dir_all(parent)?;
+                }
                 fs::rename(stage.0.join(file), layout.destination(file))?;
             }
         }
@@ -384,7 +389,7 @@ fn transaction(
     if let Err(cause) = result {
         let _ = service.stop();
         let recovered = restore(layout, &backup).and_then(|()| {
-            if running {
+            if running && had_service {
                 service.start()?;
                 service.ready(profile)?;
             }
@@ -547,6 +552,38 @@ mod tests {
         assert_eq!(
             fs::read(layout.base.join("receiver-state/credentials.json")).unwrap(),
             b"private fixture"
+        );
+    }
+    #[test]
+    fn first_install_creates_profile_directory_and_does_not_stop_a_missing_service() {
+        let (_temp, layout, root) = fixture();
+        for &file in FILES {
+            fs::remove_file(layout.destination(file)).unwrap();
+        }
+        fs::remove_file(&layout.cli).unwrap();
+        fs::remove_dir(layout.base.join("profiles")).unwrap();
+        let mut service = Fake {
+            calls: vec![],
+            fail: false,
+        };
+        transaction(
+            &layout,
+            &root,
+            &root.join("spotiya"),
+            true,
+            "mini1",
+            &mut service,
+        )
+        .unwrap();
+        assert_eq!(service.calls, ["start", "ready"]);
+        assert_eq!(
+            fs::read(layout.base.join("profiles/mini1.json")).unwrap(),
+            b"new"
+        );
+        assert!(layout.init.is_file());
+        assert_eq!(
+            fs::read_link(&layout.cli).unwrap(),
+            layout.base.join("cli.sh")
         );
     }
     #[test]

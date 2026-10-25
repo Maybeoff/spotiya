@@ -107,6 +107,7 @@ fn extract(archive: &Path, destination: &Path) -> io::Result<PathBuf> {
                     | "spotiya/LICENSE"
                     | "spotiya/bin/spotiya"
                     | "spotiya/scripts/install.sh"
+                    | "spotiya/profiles/mini1.json"
                     | "spotiya/profiles/mini2.json"
                     | "spotiya/profiles/generic.json"
                     | "spotiya/packaging/run.sh"
