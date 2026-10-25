@@ -29,6 +29,12 @@ int main(void) {
     replay(prev_release, 4, PREV);
     replay(next_gap, 4, NEXT);
     replay(tap, 2, TOGGLE);
+    {
+        struct gesture pending = {0};
+        key_event(&pending, 582, 1, 1000);
+        key_event(&pending, 582, 0, 2000);
+        assert(gesture_deadline(&pending) == 2000 + GESTURE_US);
+    }
     struct gesture g = {0};
     queued = 0;
     key_event(&g, 582, 1, 192947);
@@ -38,12 +44,16 @@ int main(void) {
     assert(queued == 2 && queue[0] == TOGGLE && queue[1] == QUIETER);
     memset(&g, 0, sizeof g);
     queued = 0;
+    assert(gesture_deadline(&g) == 0);
     key_event(&g, 115, 1, 1000);
+    assert(gesture_deadline(&g) == 451000);
     tick(&g, 450999);
     assert(queued == 1);
     tick(&g, 451000);
     assert(queued == 2 && queue[1] == LOUDER);
+    assert(gesture_deadline(&g) == 451000 + REPEAT_US);
     key_event(&g, 115, 0, 452000);
+    assert(gesture_deadline(&g) == 0);
     tick(&g, 999000);
     assert(queued == 2);
     memset(&g, 0, sizeof g);

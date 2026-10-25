@@ -42,6 +42,16 @@ static void tick(struct gesture *g, int64_t now) {
         }
     }
 }
+/* Earliest time tick() has work to do, or 0 when only a key event can change state. */
+static inline int64_t gesture_deadline(const struct gesture *g) {
+    int64_t next = g->pending;
+    for (int i = 0; i < 2; i++) {
+        const struct key *k = &g->keys[i];
+        if (k->down && !k->suppressed && (!next || k->repeat_at < next))
+            next = k->repeat_at;
+    }
+    return next;
+}
 static void key_event(struct gesture *g, unsigned code, int value, int64_t now) {
     tick(g, now);
     int i = key_index(code);
@@ -96,6 +106,7 @@ static void key_event(struct gesture *g, unsigned code, int value, int64_t now) 
 
 #define EVIOCGRAB 0x40044590UL
 #define EVIOCGKEY96 0x80604518UL
+#define EVIOCSCLOCKID 0x400445a0UL
 struct input_event_abi {
     long sec, usec;
     uint16_t type, code;
@@ -128,6 +139,10 @@ extern int mini2_receiver_running(void);
 extern int mini2_receiver_spectrum(unsigned char *levels);
 static int spotify_active(void) { return mini2_receiver_status(&current_paused, &current_volume); }
 static int command(enum action a) { return mini2_receiver_command((int)a); }
+static void earliest(int64_t *wake, int64_t at) {
+    if (at && at < *wake)
+        *wake = at;
+}
 static int empty_keys(const unsigned char *keys) {
     for (int i = 0; i < 96; i++)
         if (keys[i])
@@ -138,11 +153,18 @@ int mini2_buttons_run(const struct mini2_config *config) {
     if (!config)
         return 1;
     control_config = *config;
-    int fd = control_config.input ? open(control_config.input, O_RDONLY | O_NONBLOCK) : -1;
+    /* Without O_CLOEXEC, helpers such as playplay-decoder inherit the grab. */
+    int fd =
+        control_config.input ? open(control_config.input, O_RDONLY | O_NONBLOCK | O_CLOEXEC) : -1;
     if (control_config.input && fd < 0) {
         note("buttons: input open failed\n");
         return 1;
     }
+    /* Gesture deadlines compare event times with the clock; NTP steps the realtime one. */
+    clockid_t event_clock = CLOCK_MONOTONIC;
+    int monotonic = CLOCK_MONOTONIC;
+    if (fd >= 0 && ioctl(fd, EVIOCSCLOCKID, &monotonic) < 0)
+        event_clock = CLOCK_REALTIME;
     struct gesture g = {0};
     struct lights lights = {0};
     struct display display = {0};
@@ -218,7 +240,7 @@ int mini2_buttons_run(const struct mini2_config *config) {
             }
         }
         if (grabbed && wanted)
-            tick(&g, now_us(CLOCK_REALTIME));
+            tick(&g, now_us(event_clock));
         for (size_t i = 0; i < queued && wanted && running; i++) {
             if (now_us(CLOCK_MONOTONIC) >= probe_at) {
                 wanted = spotify_active();
@@ -249,18 +271,36 @@ int mini2_buttons_run(const struct mini2_config *config) {
             }
         }
         queued = 0;
+        int64_t now = now_us(CLOCK_MONOTONIC), wake = probe_at;
         if (wanted) {
-            lights_tick(&lights, now_us(CLOCK_MONOTONIC));
-            display_tick(&display, now_us(CLOCK_MONOTONIC));
+            lights_tick(&lights, now);
+            display_tick(&display, now);
             unsigned char levels[4] = {0};
             int spectrum = mini2_receiver_spectrum(levels);
-            display_spectrum(&display, levels, spectrum, now_us(CLOCK_MONOTONIC));
+            display_spectrum(&display, levels, spectrum, now);
+            if (lights.active)
+                earliest(&wake, lights.next_frame);
+            if (display.active) {
+                earliest(&wake, display.check_at);
+                if (display.mode == DISPLAY_SPECTRUM)
+                    earliest(&wake, display.next_frame);
+            } else if (spectrum)
+                earliest(&wake, display.yield_until > now ? display.yield_until : now + 50000);
+            if (grabbed) {
+                int64_t gesture = gesture_deadline(&g);
+                /* Gesture times use the event clock; shift them onto the monotonic one. */
+                if (gesture)
+                    earliest(&wake, gesture - now_us(event_clock) + now);
+            }
         } else {
             lights_close(&lights, 1);
             display_close(&display);
         }
+        /* Sleep until the next deadline instead of waking every 10 ms while idle. */
+        int64_t wait = wake - now_us(CLOCK_MONOTONIC);
+        int timeout = wait <= 0 ? 0 : wait >= 300000 ? 300 : (int)((wait + 999) / 1000);
         struct pollfd pfd = {fd, POLLIN, 0};
-        poll(&pfd, 1, 10);
+        poll(&pfd, fd >= 0 ? 1 : 0, timeout);
     }
     if (grabbed)
         ioctl(fd, EVIOCGRAB, 0);
