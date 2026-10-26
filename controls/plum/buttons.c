@@ -164,10 +164,10 @@ int plum_buttons_run(const struct mini2_config *config) {
         note("buttons: cannot open input\n");
         return 1;
     }
-    clockid_t event_clock = CLOCK_REALTIME;
-    if (fd >= 0 && ioctl(fd, EVIOCSCLOCKID, &event_clock) < 0)
-        event_clock = CLOCK_MONOTONIC;
-    struct pollfd pfd = {fd, POLLIN, 0};
+    clockid_t event_clock = CLOCK_MONOTONIC;
+    clockid_t event_monotonic = CLOCK_MONOTONIC;
+    if (fd >= 0 && ioctl(fd, EVIOCSCLOCKID, &event_monotonic) < 0)
+        event_clock = CLOCK_REALTIME;
     struct input_event_abi events[64];
     unsigned char held[96] = {0}, actual[96] = {0};
     struct gesture g = {0};
@@ -180,10 +180,10 @@ int plum_buttons_run(const struct mini2_config *config) {
     note(fd >= 0 ? "buttons: ready (Alice control until Spotify is active)\n"
                   : "buttons: ready (no input device, Spotify control)\n");
     while (running) {
-        int64_t now = now_us(CLOCK_MONOTONIC);
-        if (now >= probe_at) {
+        int64_t mono = now_us(CLOCK_MONOTONIC);
+        if (mono >= probe_at) {
             wanted = spotify_active();
-            probe_at = now + 300000;
+            probe_at = mono + 300000;
         }
         if (fd >= 0) {
             ssize_t n = read(fd, events, sizeof events);
@@ -233,7 +233,6 @@ int plum_buttons_run(const struct mini2_config *config) {
         }
         if (grabbed && wanted)
             tick(&g, now_us(event_clock));
-        for 
         for (size_t i = 0; i < queued && wanted && running; i++) {
             if (now_us(CLOCK_MONOTONIC) >= probe_at) {
                 wanted = spotify_active();

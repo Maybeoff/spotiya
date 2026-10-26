@@ -86,13 +86,17 @@ static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 pub extern "C" fn plum_receiver_running() -> i32 {
     mini2_receiver_running()
 }
+/// # Safety
+/// Non-null pointers must reference writable, aligned `i32` objects for this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn plum_receiver_status(paused: *mut i32, volume: *mut i32) -> i32 {
-    mini2_receiver_status(paused, volume)
+    unsafe { mini2_receiver_status(paused, volume) }
 }
+/// # Safety
+/// A non-null `levels` must reference four writable bytes for this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn plum_receiver_spectrum(levels: *mut u8) -> i32 {
-    mini2_receiver_spectrum(levels)
+    unsafe { mini2_receiver_spectrum(levels) }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn plum_receiver_command(action: i32) -> i32 {

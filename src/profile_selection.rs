@@ -89,6 +89,11 @@ pub fn choices(state: &Path) -> io::Result<Vec<Choice>> {
             "Yandex Station Mini 2",
             "Mini 2 controls and Quasar IPC",
         ),
+        (
+            "plum",
+            "Yandex Station Lite 2 (Plum)",
+            "Plum controls and Quasar IPC",
+        ),
         ("generic", "Generic ALSA", "Audio only"),
     ] {
         out.push(Choice {
@@ -159,7 +164,7 @@ pub fn resolve(state: &Path, selection: &str) -> io::Result<Saved> {
     } else {
         selection
     };
-    if matches!(selection, "auto" | "mini1" | "mini2" | "generic") {
+    if matches!(selection, "auto" | "mini1" | "mini2" | "plum" | "generic") {
         return Ok(Saved {
             version: 1,
             selection: selection.into(),

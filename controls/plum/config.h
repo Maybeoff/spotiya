@@ -24,7 +24,7 @@ struct mini2_config {
 static struct mini2_config control_config = {"/dev/input/event2",
                                              "/sys/class/leds/plum:",
                                              "/sys/class/leds/plum:white:clock",
-                                             0,
+                                             582,
                                              115,
                                              114,
                                              {0, 0},

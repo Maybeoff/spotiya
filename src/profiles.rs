@@ -9,6 +9,7 @@ use std::{
 
 const MINI1: &str = include_str!("../profiles/mini1.json");
 const MINI2: &str = include_str!("../profiles/mini2.json");
+const PLUM: &str = include_str!("../profiles/plum.json");
 const GENERIC: &str = include_str!("../profiles/generic.json");
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -639,5 +640,12 @@ mod tests {
         f.file("state/profile.json", vec![b' '; 32769]);
         assert!(f.load("auto").is_err());
     }
+    #[test]
+    fn plum_profile_uses_the_recorded_hardware_keys() {
+        let p = parse(PLUM).unwrap();
+        let c = p.controls.unwrap();
+        assert_eq!(c.keys.alice, 582);
+        assert_eq!(c.keys.volume_up, 115);
+        assert_eq!(c.keys.volume_down, 114);
+    }
 }
-const PLUM: &str = include_str!("../profiles/plum.json");
