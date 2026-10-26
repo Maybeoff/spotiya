@@ -245,7 +245,8 @@ fn detect(root: &Path) -> &'static str {
     } else if compatible
         .split(|b| *b == 0)
         .any(|s| s == b"yandex,plum" || s == b"yandex,plum-evt2")
-        || model.split(|b| *b == 0).next() == Some(b"Yandex Plum".as_slice()) || model.split(|b| *b == 0).next() == Some(b"Yandex-Lite".as_slice())
+        || model.split(|b| *b == 0).next() == Some(b"Yandex Plum".as_slice())
+        || model.split(|b| *b == 0).next() == Some(b"Yandex-Lite".as_slice())
     {
         "plum"
     } else {
