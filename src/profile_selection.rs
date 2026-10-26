@@ -65,7 +65,7 @@ pub fn read(state: &Path) -> io::Result<Option<Saved>> {
         saved.profile = Some(profiles::parse(&serde_json::to_string(&p)?)?);
     } else if !matches!(
         saved.selection.as_str(),
-        "auto" | "mini1" | "mini2" | "generic"
+        "auto" | "mini1" | "mini2" | "plum" | "generic"
     ) {
         return Err(invalid("Unknown saved profile"));
     }
@@ -111,7 +111,7 @@ pub fn choices(state: &Path) -> io::Result<Vec<Choice>> {
                 if path.extension().is_none_or(|s| s != "json")
                     || matches!(
                         path.file_name().and_then(|s| s.to_str()),
-                        Some("mini1.json" | "mini2.json" | "generic.json")
+                        Some("mini1.json" | "mini2.json" | "plum.json" | "generic.json")
                     )
                 {
                     continue;

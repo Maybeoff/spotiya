@@ -66,6 +66,7 @@ pub struct Voice {
 #[serde(rename_all = "snake_case")]
 pub enum Driver {
     Mini2,
+    Plum,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -229,6 +230,7 @@ fn detect(root: &Path) -> &'static str {
         {
             Some("yandexmini") => return "mini1",
             Some("yandexmini_2") => return "mini2",
+            Some("plum") => return "plum",
             _ => {}
         }
     }
@@ -240,6 +242,12 @@ fn detect(root: &Path) -> &'static str {
         || model.split(|b| *b == 0).next() == Some(b"Yandex Station Mini 2".as_slice())
     {
         "mini2"
+    } else if compatible
+        .split(|b| *b == 0)
+        .any(|s| s == b"yandex,plum" || s == b"yandex,plum-evt2")
+        || model.split(|b| *b == 0).next() == Some(b"Yandex Plum".as_slice()) || model.split(|b| *b == 0).next() == Some(b"Yandex-Lite".as_slice())
+    {
+        "plum"
     } else {
         "generic"
     }
@@ -266,24 +274,44 @@ fn capabilities(p: &Profile, root: &Path) -> Capabilities {
                 })
         });
         caps.ring = c.ring_prefix.as_ref().is_some_and(|prefix| {
-            ["red", "green", "blue"].iter().all(|color| {
-                (1..=6).all(|segment| {
-                    rooted(root, &format!("{prefix}{color}:ring{segment}/brightness")).exists()
+            if matches!(p.id.as_str(), "plum") {
+                ["red", "green", "blue"].iter().all(|color| {
+                    (1..=3).all(|segment| {
+                        rooted(root, &format!("{prefix}{color}:ring{segment}/brightness")).exists()
+                    })
                 })
-            })
+            } else {
+                ["red", "green", "blue"].iter().all(|color| {
+                    (1..=6).all(|segment| {
+                        rooted(root, &format!("{prefix}{color}:ring{segment}/brightness")).exists()
+                    })
+                })
+            }
         });
         caps.display = c.display_prefix.as_ref().is_some_and(|prefix| {
-            (1..=4).all(|digit| {
-                (b'A'..=b'G').all(|segment| {
-                    rooted(
-                        root,
-                        &format!("{prefix}{}{digit}/brightness", char::from(segment)),
-                    )
-                    .exists()
+            if matches!(p.id.as_str(), "plum") {
+                (0..=3).all(|digit| {
+                    (b'A'..=b'H').all(|segment| {
+                        rooted(
+                            root,
+                            &format!("{prefix}{}{digit}/brightness", char::from(segment)),
+                        )
+                        .exists()
+                    })
                 })
-            }) && ["PLUS1", "PLUS2", "PLUS3", "PLUS4", "MINUS", "DEGREE"]
-                .iter()
-                .all(|suffix| rooted(root, &format!("{prefix}{suffix}/brightness")).exists())
+            } else {
+                (1..=4).all(|digit| {
+                    (b'A'..=b'G').all(|segment| {
+                        rooted(
+                            root,
+                            &format!("{prefix}{}{digit}/brightness", char::from(segment)),
+                        )
+                        .exists()
+                    })
+                }) && ["PLUS1", "PLUS2", "PLUS3", "PLUS4", "MINUS", "DEGREE"]
+                    .iter()
+                    .all(|suffix| rooted(root, &format!("{prefix}{suffix}/brightness")).exists())
+            }
         });
     }
     caps
@@ -341,6 +369,7 @@ fn load_at(selection: &str, state_dir: &Path, root: &Path) -> io::Result<Resolve
     let profile = match selection {
         "mini1" => parse(MINI1)?,
         "mini2" => parse(MINI2)?,
+        "plum" => parse(PLUM)?,
         "generic" => parse(GENERIC)?,
         path => read_file(Path::new(path))?,
     };
@@ -393,6 +422,7 @@ struct NativeConfig {
 }
 unsafe extern "C" {
     fn mini2_buttons_run(config: *const NativeConfig) -> i32;
+    fn plum_buttons_run(config: *const NativeConfig) -> i32;
 }
 impl Controls {
     pub fn run(&self, caps: Capabilities) -> io::Result<i32> {
@@ -436,7 +466,10 @@ impl Controls {
             clock_pause: NativeAnimation::of(&clock.pause),
             volume: NativeAnimation::of(&animations.volume),
         };
-        Ok(unsafe { mini2_buttons_run(&config) })
+        match self.driver {
+            Driver::Mini2 => Ok(unsafe { mini2_buttons_run(&config) }),
+            Driver::Plum => Ok(unsafe { plum_buttons_run(&config) }),
+        }
     }
 }
 
@@ -606,3 +639,4 @@ mod tests {
         assert!(f.load("auto").is_err());
     }
 }
+const PLUM: &str = include_str!("../profiles/plum.json");

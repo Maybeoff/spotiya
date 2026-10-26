@@ -83,6 +83,22 @@ struct Shared {
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 
 #[unsafe(no_mangle)]
+pub extern "C" fn plum_receiver_running() -> i32 {
+    mini2_receiver_running()
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn plum_receiver_status(paused: *mut i32, volume: *mut i32) -> i32 {
+    mini2_receiver_status(paused, volume)
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn plum_receiver_spectrum(levels: *mut u8) -> i32 {
+    mini2_receiver_spectrum(levels)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn plum_receiver_command(action: i32) -> i32 {
+    mini2_receiver_command(action)
+}
+#[unsafe(no_mangle)]
 pub extern "C" fn mini2_receiver_running() -> i32 {
     SHARED
         .get()
@@ -418,7 +434,7 @@ fn options() -> Result<Option<Options>, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --addons | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --addon-install ID | --addon-install-file ID ARCHIVE SHA256SUMS | --addon-remove ID\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --airplay on/off | --release | --retry"
+                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|plum|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --addons | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --addon-install ID | --addon-install-file ID ARCHIVE SHA256SUMS | --addon-remove ID\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --airplay on/off | --release | --retry"
                 );
                 return Ok(None);
             }

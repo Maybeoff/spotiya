@@ -2,4 +2,4 @@
 channel = "1.98.0"
 profile = "minimal"
 components = ["rustfmt", "clippy"]
-targets = ["armv7-unknown-linux-gnueabihf"]
+targets = ["armv7-unknown-linux-gnueabihf", "aarch64-unknown-linux-gnu"]

@@ -25,6 +25,7 @@ const FILES: &[&str] = &[
     "cli.sh",
     "profiles/mini1.json",
     "profiles/mini2.json",
+    "profiles/plum.json",
     "profiles/generic.json",
     "S99spotify-connect",
 ];

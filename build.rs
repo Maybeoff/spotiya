@@ -6,6 +6,7 @@ fn main() {
     }
     native
         .file("controls/mini2/buttons.c")
+        .file("controls/plum/buttons.c")
         .file("controls/stdio.c")
         .flag_if_supported("-std=c11")
         .flag_if_supported("-Os")
@@ -15,6 +16,7 @@ fn main() {
         .compile("mini2_controls");
     for name in ["buttons.c", "config.h", "lights.h", "display.h"] {
         println!("cargo:rerun-if-changed=controls/mini2/{name}");
+        println!("cargo:rerun-if-changed=controls/plum/{name}");
     }
     println!("cargo:rerun-if-changed=controls/stdio.c");
     println!("cargo:rerun-if-changed=controls/alsa_compat.c");
